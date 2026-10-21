@@ -20,7 +20,11 @@ use nydus_format::utils::SHA256_DIGEST_SIZE;
 use nydus_telemetry::metrics::ImageMetrics;
 
 use super::chunk_group_lock::ChunkGroupLocks;
-use super::{plan_prefetch_batches, validate_chunk_group_for_image, BlobCache, ChunkGroupBuffers};
+use super::{
+    plan_prefetch_batches, plan_prefetch_batches_in, validate_chunk_group_for_image, BlobCache,
+    ChunkGroupBuffers,
+};
+use crate::ranges::BlobRanges;
 
 #[derive(Clone)]
 enum FlightResult {
@@ -731,6 +735,85 @@ impl LocalBlobCache {
         self.chunk_group_map.set_ready(group.index() as usize)
     }
 
+    /// The chunk groups overlapping `ranges`, as sorted runs of consecutive
+    /// group indexes. Ranges that share a group, or fall in adjacent groups,
+    /// join one run; a group no range touches separates two runs.
+    fn chunk_group_runs(&self, ranges: &BlobRanges) -> io::Result<Vec<Range<usize>>> {
+        let logical_size = self.blob_metadata.logical_size();
+        let mut runs: Vec<Range<usize>> = Vec::new();
+        for range in ranges.as_slice() {
+            if range.end > logical_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "prefetch range {range:?} exceeds blob {} of {logical_size} bytes",
+                        self.blob_index
+                    ),
+                ));
+            }
+            let span = self.chunk_group_span(range.start, range.end)?;
+            match runs.last_mut() {
+                Some(run) if span.start <= run.end => {
+                    assert!(span.start >= run.start, "ranges are sorted");
+                    run.end = run.end.max(span.end);
+                }
+                _ => runs.push(span),
+            }
+        }
+        Ok(runs)
+    }
+
+    /// Fetch, decode, validate, cache and publish the groups of `runs`
+    /// (sorted, disjoint group index ranges) in fetch-size batches that never
+    /// span two runs.
+    fn prefetch_group_runs(
+        &self,
+        runs: &[Range<usize>],
+        workers: usize,
+        deadline: Option<Instant>,
+    ) -> io::Result<()> {
+        // Fast path: another process (or an earlier run) already decoded
+        // every group; skip the batch planning and per-group readiness scan.
+        if runs.is_empty() || self.chunk_group_map.is_all_ready() {
+            return Ok(());
+        }
+
+        let cache_file = self.cache_file()?;
+        // Prefetch writes the bulk of the cache, so it is worth one stat to
+        // make sure the file it fills is still the one other processes read.
+        self.ensure_data_file_linked(&cache_file)?;
+
+        // Prefetch owns its decode buffers and takes no group locks, so it
+        // never blocks on-demand reads. The chunk group map is atomic and
+        // `set_ready` is idempotent, so racing with a read at worst decodes
+        // the same group twice into identical bytes at the same cache offset.
+        // Batches follow the on-demand fetch size so both paths issue
+        // backend reads of the same size; a zero fetch size reads group by
+        // group. With several workers the first batches are single groups,
+        // so the head of a blob lands in the first round trip instead of
+        // behind a full batch.
+        let workers = workers.max(1);
+        let ramp = if workers > 1 { workers } else { 0 };
+        let batches =
+            plan_prefetch_batches_in(&self.blob_metadata, runs, super::fetch_size(), ramp);
+        self.run_batches(&batches, workers, deadline, &|batch, buffers| {
+            self.prefetch_batch(batch.clone(), buffers, cache_file.as_ref())
+        })?;
+
+        // A successful prefetch of every group means every group is now
+        // ready (decoded here or observed ready from another process), so
+        // guarantee the sticky ALL_READY flag is latched before returning.
+        // set_ready normally latches it through the shared ready counter, but
+        // a historical writer crash between its bit and counter updates
+        // leaves the counter short forever; the authoritative bitmap scan
+        // inside latch_all_ready() latches the flag regardless. A partial
+        // selection leaves the latch to the counter.
+        if matches!(runs, [run] if *run == (0..self.blob_metadata.chunk_group_count())) {
+            self.chunk_group_map.latch_all_ready();
+        }
+        Ok(())
+    }
+
     /// Ensure every group overlapping `[offset, offset + len)` is decoded and
     /// written to the cache file. Shared by `read_at` and `ensure_range`.
     fn ensure_byte_range(&self, offset: u64, len: u64, cache_file: &File) -> io::Result<()> {
@@ -775,45 +858,24 @@ impl Drop for LocalBlobCache {
 
 impl BlobCache for LocalBlobCache {
     fn prefetch_all(&self, workers: usize, deadline: Option<Instant>) -> io::Result<()> {
-        if self.blob_metadata.chunk_group_count() == 0 {
+        let count = self.blob_metadata.chunk_group_count();
+        if count == 0 {
             return Ok(());
         }
-        // Fast path: another process (or an earlier run) already decoded
-        // every group; skip the batch planning and per-group readiness scan.
-        if self.chunk_group_map.is_all_ready() {
+        self.prefetch_group_runs(std::slice::from_ref(&(0..count)), workers, deadline)
+    }
+
+    fn prefetch_ranges(
+        &self,
+        ranges: &BlobRanges,
+        workers: usize,
+        deadline: Option<Instant>,
+    ) -> io::Result<()> {
+        if ranges.is_empty() || self.chunk_group_map.is_all_ready() {
             return Ok(());
         }
-
-        let cache_file = self.cache_file()?;
-        // Prefetch writes the bulk of the cache, so it is worth one stat to
-        // make sure the file it fills is still the one other processes read.
-        self.ensure_data_file_linked(&cache_file)?;
-
-        // Prefetch owns its decode buffers and takes no group locks, so it
-        // never blocks on-demand reads. The chunk group map is atomic and
-        // `set_ready` is idempotent, so racing with a read at worst decodes
-        // the same group twice into identical bytes at the same cache offset.
-        // Batches follow the on-demand fetch size so both paths issue
-        // backend reads of the same size; a zero fetch size reads group by
-        // group. With several workers the first batches are single groups,
-        // so the head of a blob lands in the first round trip instead of
-        // behind a full batch.
-        let workers = workers.max(1);
-        let ramp = if workers > 1 { workers } else { 0 };
-        let batches = plan_prefetch_batches(&self.blob_metadata, super::fetch_size(), ramp);
-        self.run_batches(&batches, workers, deadline, &|batch, buffers| {
-            self.prefetch_batch(batch.clone(), buffers, cache_file.as_ref())
-        })?;
-
-        // A successful full prefetch means every group is now ready (decoded
-        // here or observed ready from another process), so guarantee the
-        // sticky ALL_READY flag is latched before returning. set_ready
-        // normally latches it through the shared ready counter, but a
-        // historical writer crash between its bit and counter updates leaves
-        // the counter short forever; the authoritative bitmap scan inside
-        // latch_all_ready() latches the flag regardless.
-        self.chunk_group_map.latch_all_ready();
-        Ok(())
+        let runs = self.chunk_group_runs(ranges)?;
+        self.prefetch_group_runs(&runs, workers, deadline)
     }
 
     fn read_at(&self, offset: u64, dst: &mut [u8]) -> io::Result<()> {
@@ -1446,6 +1508,62 @@ mod tests {
         assert_eq!(fs::read(&cached.cache_data_path).unwrap(), image);
     }
 
+    /// Range prefetch fills exactly the groups its ranges touch: neighbours
+    /// share a read, an untouched group between selected ones is never
+    /// fetched (not even inside a generous fetch size), and on-demand reads
+    /// still fill it later.
+    #[test]
+    fn prefetch_ranges_fetches_only_the_selected_groups() {
+        let _env = env_lock();
+        super::super::set_fetch_size(1 << 20);
+        let backend_dir = tempdir().unwrap();
+        let (data, meta, _, image) = groups_blob();
+        let full_blob_id = FullBlob::new(&data)
+            .with_blob_metadata(&meta)
+            .with_blob_metadata_file()
+            .save_in(backend_dir.path());
+        let cache_dir = tempdir().unwrap();
+        let backend = CountingBackend::new(backend_dir.path());
+        let cached = open(full_blob_id, cache_dir.path(), backend.clone());
+        let compressed = |index: usize| meta.chunk_group(index).unwrap().compressed_range();
+
+        // Group 0 and 1 through one range crossing their boundary and one
+        // inside group 1, group 3 through a single byte; group 2 untouched.
+        let ranges: BlobRanges = [16380..16390, 16384 + 5..16384 + 6, 3 * 16384..3 * 16384 + 1]
+            .into_iter()
+            .collect();
+        cached.prefetch_ranges(&ranges, 1, None).unwrap();
+        assert_eq!(
+            backend.ranges(),
+            vec![compressed(0).start..compressed(1).end, compressed(3)]
+        );
+        for (index, ready) in [true, true, false, true].into_iter().enumerate() {
+            assert_eq!(cached.is_chunk_group_ready(index), ready, "group {index}");
+        }
+        assert!(!cached.is_all_ready());
+        let cache = fs::read(&cached.cache_data_path).unwrap();
+        assert_eq!(cache[..2 * 16384], image[..2 * 16384]);
+        assert_eq!(cache[3 * 16384..], image[3 * 16384..]);
+        assert!(cache[2 * 16384..3 * 16384].iter().all(|byte| *byte == 0));
+
+        // Ready groups cost nothing on a second pass, with any worker count.
+        cached.prefetch_ranges(&ranges, 4, None).unwrap();
+        assert_eq!(backend.reads(), 2);
+
+        // A range past the blob is a corrupt selection, not a silent skip.
+        let beyond: BlobRanges = std::iter::once(4 * 16384..4 * 16384 + 1).collect();
+        let err = cached.prefetch_ranges(&beyond, 1, None).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // On demand, the unselected group is fetched alone (its fetch-size
+        // cell is trimmed at the ready neighbours) and completes the blob.
+        let mut buf = vec![0u8; 64];
+        cached.read_at(2 * 16384 + 7, &mut buf).unwrap();
+        assert_eq!(buf, image[2 * 16384 + 7..2 * 16384 + 71]);
+        assert_eq!(backend.ranges()[2], compressed(2));
+        assert!(cached.is_all_ready());
+    }
+
     /// Every chunk group a read touches lands in the trace once, hit or miss.
     #[test]
     fn reads_trace_the_chunk_groups_they_touch() {
@@ -1547,6 +1665,8 @@ mod tests {
     struct CountingBackend {
         inner: Local,
         reads: AtomicUsize,
+        /// The data-region byte range of every read, in call order.
+        ranges: Mutex<Vec<Range<u64>>>,
     }
 
     impl CountingBackend {
@@ -1554,11 +1674,16 @@ mod tests {
             Arc::new(Self {
                 inner: Local::new(dir.to_path_buf()),
                 reads: AtomicUsize::new(0),
+                ranges: Mutex::new(Vec::new()),
             })
         }
 
         fn reads(&self) -> usize {
             self.reads.load(Ordering::SeqCst)
+        }
+
+        fn ranges(&self) -> Vec<Range<u64>> {
+            self.ranges.lock().unwrap().clone()
         }
     }
 
@@ -1575,6 +1700,10 @@ mod tests {
             ctx: ReadContext,
         ) -> io::Result<()> {
             self.reads.fetch_add(1, Ordering::SeqCst);
+            self.ranges
+                .lock()
+                .unwrap()
+                .push(offset..offset + dst.len() as u64);
             self.inner.read_range_into(blob_id, offset, dst, ctx)
         }
     }

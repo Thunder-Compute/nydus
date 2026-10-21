@@ -7,5 +7,6 @@
 //! from `nydus-test-utils`.
 
 mod erofs_reader;
+mod image_prefetch;
 mod incremental_writer;
 mod nydus_core;

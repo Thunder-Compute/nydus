@@ -12,3 +12,4 @@ pub mod cache;
 pub mod chunk_group_map;
 pub mod io;
 pub mod prefetch;
+pub mod ranges;

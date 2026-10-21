@@ -21,6 +21,15 @@ use nydus_telemetry::metrics::ImageMetrics;
 
 use super::remote::DecodedGroupCache;
 use super::{BlobCache, LocalBlobCache, RawDeviceBlobCache, RemoteBlobCache};
+use crate::ranges::BlobRanges;
+
+/// Which chunk groups of a plain (non-REDIRECT) blob a prefetch fills.
+pub enum GroupSelection<'a> {
+    All,
+    /// The groups overlapping these decoded ranges.
+    Ranges(&'a BlobRanges),
+    None,
+}
 
 /// A blob referenced by the bootstrap device table. The blob cache is opened
 /// lazily on first read or prefetch so mounting does not pay a blob.meta
@@ -193,8 +202,27 @@ impl BlobCaches {
         workers: usize,
         timeout: Duration,
     ) -> io::Result<()> {
+        self.prefetch_blob_groups(blob_index, GroupSelection::All, workers, timeout)
+    }
+
+    /// Prefetch the chunk groups of the blob identified by `blob_index` that
+    /// `selection` picks. An "ondemand" (REDIRECT) blob is never addressed by
+    /// the filesystem and is streamed into its sources as by
+    /// [`prefetch_blob`](Self::prefetch_blob) whatever the selection.
+    /// Workers and timeout as for [`prefetch_blob`](Self::prefetch_blob).
+    pub fn prefetch_blob_groups(
+        &self,
+        blob_index: u16,
+        selection: GroupSelection<'_>,
+        workers: usize,
+        timeout: Duration,
+    ) -> io::Result<()> {
         let deadline = (!timeout.is_zero()).then(|| Instant::now() + timeout);
         let cache = self.cache(blob_index)?;
+        if !cache.is_redirect() && matches!(selection, GroupSelection::None) {
+            info!("blob {blob_index} holds no data the image reaches, not prefetched");
+            return Ok(());
+        }
         // Serialize prefetch of the same blob across processes sharing the
         // cache directory: with many identical instances cold-starting on one
         // node, only the lock owner streams from the backend while the others
@@ -204,7 +232,21 @@ impl BlobCaches {
         // until this function returns.
         let _prefetch_lock = cache.prefetch_lock();
         if !cache.is_redirect() {
-            return cache.prefetch_all(workers, deadline);
+            return match selection {
+                GroupSelection::All => cache.prefetch_all(workers, deadline),
+                GroupSelection::Ranges(ranges) => {
+                    let start = Instant::now();
+                    let result = cache.prefetch_ranges(ranges, workers, deadline);
+                    info!(
+                        "blob {blob_index} image prefetch of {} reachable bytes in {} ranges finished in {:.3?}",
+                        ranges.len_bytes(),
+                        ranges.as_slice().len(),
+                        start.elapsed(),
+                    );
+                    result
+                }
+                GroupSelection::None => unreachable!("returned before taking the lock"),
+            };
         }
         // Time the ondemand blob prefetch and report how many source groups
         // it warmed versus skipped, so operators can tell whether the warmup

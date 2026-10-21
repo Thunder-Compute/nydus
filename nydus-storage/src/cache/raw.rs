@@ -16,6 +16,7 @@ use nydus_backend::{BlobBackend, RawDeviceFile, ReadContext, ReadKind};
 use nydus_format::utils::SHA256_DIGEST_SIZE;
 
 use super::BlobCache;
+use crate::ranges::BlobRanges;
 
 /// A blob cache that passes reads through to the backend unchanged.
 pub struct RawDeviceBlobCache {
@@ -59,6 +60,15 @@ impl BlobCache for RawDeviceBlobCache {
 
     /// A raw device holds no chunk groups to warm.
     fn prefetch_all(&self, _workers: usize, _deadline: Option<Instant>) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn prefetch_ranges(
+        &self,
+        _ranges: &BlobRanges,
+        _workers: usize,
+        _deadline: Option<Instant>,
+    ) -> io::Result<()> {
         Ok(())
     }
 

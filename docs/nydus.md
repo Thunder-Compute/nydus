@@ -1132,8 +1132,8 @@ Fields:
 	for the trade-off.
 - `prefetch.concurrent_blob_count` (default `10`) caps how many blobs are
 	prefetched concurrently.
-- `prefetch.timeout` (default `1h`) bounds how long prefetching one whole
-	blob may take, while `http.timeout` bounds each backend request within it;
+- `prefetch.timeout` (default `1h`) bounds how long prefetching one blob's
+	selected data may take, while `http.timeout` bounds each backend request within it;
 	`0s` disables the bound. A blob that exceeds it is aborted with a warning
 	and prefetch moves on.
 - `prefetch.retry_delay_min` / `prefetch.retry_delay_max` (defaults `6h` /
@@ -1143,12 +1143,15 @@ Fields:
 	spreads out instead of stampeding. `retry_delay_min` must not exceed
 	`retry_delay_max`. Only throttled failures are rescheduled; other prefetch
 	failures are logged and skipped.
-- `prefetch.scope` (default `auto`) selects which blobs to pull. `none`
+- `prefetch.scope` (default `auto`) selects what to pull. `none`
         disables prefetch; `ondemand` prefetches only the "ondemand" redirect blob
         `nydus optimize` emits (if any), landing the access-ordered hot set in the
         source blobs' caches while leaving backend bandwidth to on-demand reads;
-        `all` prefetches every blob — the ondemand blob first, then the other
-        priority blobs, then the rest; `auto` behaves like `ondemand` when a
+        `all` prefetches all data the mounted image can read — the ondemand blob
+        first, then the chunk groups holding reachable file data in the other
+        priority blobs, then in the rest — and skips groups no reachable file
+        uses, such as data a layer merge deleted or that only other images
+        sharing the blob reference; `auto` behaves like `ondemand` when a
         priority blob is an ondemand blob and like `all` otherwise, so an
         unoptimized image is still streamed in the background.
         See [Blob prefetch](#blob-prefetch).
@@ -2402,12 +2405,16 @@ decoding chunk groups synchronously. Prefetch is **off by default**: enable it w
 turns it on); the config's `prefetch` block also sizes the worker pool. See
 [Storage config](#storage-config).
 
-Per-blob prefetch streams chunk groups into the cache:
+Per-blob prefetch streams the selected chunk groups into the cache (see
+[Image data selection](#image-data-selection) for which groups `all`
+selects):
 
-- Prefetch reads the data region in batches of consecutive chunk groups
-	whose compressed bytes add up to `storage.fetch_size` (default 2 MiB),
-	so prefetch and on-demand reads issue backend requests of the same size;
-	a zero fetch size reads group by group.
+- Prefetch reads the data region in batches of consecutive selected chunk
+	groups whose compressed bytes add up to `storage.fetch_size` (default
+	2 MiB), so prefetch and on-demand reads issue backend requests of the same
+	size; a zero fetch size reads group by group. A batch never spans a group
+	that is not selected: two runs of selected groups separated by an unused
+	one cost two reads rather than one read that also fetches the gap.
 - For each batch it issues a single contiguous backend range read, then
 	decodes each contained chunk group (plain copy, zstd or LZ4), validates
 	the group's length and CRC32C, writes the decoded bytes to the cache file
@@ -2441,10 +2448,11 @@ way a classic nydusd mount would. The resolution is logged.
         always streamed first regardless of their position in the list. Under
         `ondemand` they are the only blobs warmed; other priority blobs are skipped
         so backend bandwidth is not spent pulling whole source blobs. Under `all` the
-        other priority blobs follow, and the groups the redirect stream already
-        filled in their caches are trimmed off their batches.
-2. Only when `prefetch.scope` is `all`, the remaining blob devices are then
-        prefetched concurrently by a worker pool sized to
+        image data in the other priority blobs follows, and the groups the
+        redirect stream already filled in their caches are trimmed off their
+        batches.
+2. Only when `prefetch.scope` is `all`, the image data in the remaining blob
+        devices is then prefetched concurrently by a worker pool sized to
         `min(prefetch.concurrent_blob_count, remaining)` (default `10`). Under
         `ondemand` and `auto` a pool of the same size instead opens every blob's
         cache (fetches and validates the blob metas, creates the sparse files)
@@ -2472,6 +2480,55 @@ and skipped, so a bad copy can only lose warmup, never poison a source cache
 or abort the prefetch. The prefetch logs how long the ondemand blob took and
 how many groups it filled and skipped, so operators can tell whether the
 warmup outran the workload.
+
+### Image data selection
+
+`all` warms what the mounted image can read, not every byte of the blobs it
+references. A blob is often only partly used by an image: a merged image's
+upper layers delete or replace lower files whose data stays in the lower
+blob, and a blob shared by several images may hold data only some of them
+reach. Fetching such data costs backend bandwidth, decode CPU and cache
+space for nothing.
+
+When the scope resolves to `all`, the prefetch thread first walks the
+bootstrap from the root directory, after the ondemand blobs have streamed and
+off the mount path:
+
+- Every directory is entered once and every regular file is visited once,
+	however many hardlinks name it.
+- A chunk-based file contributes, per non-hole chunk, the span of the blob's
+	decoded address space a whole-file read resolves (the last chunk up to
+	the file size); holes and bootstrap-local chunks contribute nothing.
+	Flat file data, directories and symlinks live in the bootstrap.
+- The spans are merged into sorted, disjoint ranges per blob, so chunks
+	that several files share are counted once.
+
+Each blob's cache maps its ranges to the chunk groups overlapping them (one
+group index lookup per range end) and prefetches those groups in runs of
+consecutive groups, as described above. The compression and validation unit
+stays the chunk group: a selected group is fetched, decoded, checked and
+cached whole, including chunks of unreachable files packed into it, while a
+group no range touches is never fetched. Blobs without reachable data are
+not fetched at all. The ondemand blob is not addressed by the filesystem and
+is streamed into its sources exactly as before.
+
+Two cases fall back to whole blobs, so data is never silently skipped:
+
+- Images with z_erofs (compressed) files. Their pclusters and packed
+	fragments are not resolved to ranges; such files only exist on native
+	layers, whose store files are read in place and never prefetched, so
+	the fallback costs nothing there.
+- A walk that fails on metadata the read path would reject as well; the
+	failure is logged.
+
+Fetched groups land in the normal cache with the usual validation, ready
+bits, prefetch lock and on-demand fallback. Because the group map is shared,
+another image (or process) referencing the same blob reuses the groups this
+image warmed and fetches the rest on demand or through its own prefetch,
+which trims the groups already ready. A blob that an image uses only partly
+does not reach `ALL_READY` through its prefetch, so reads keep checking
+group readiness instead of using the all-ready mapping until every group has
+been filled by some image. (by Claude)
 
 ### Cross-process cache sharing and prefetch dedup
 
@@ -2521,7 +2578,8 @@ so a fully warmed blob costs one load per request instead of a bitmap walk.
 final byte) when the flag is not yet set, and latches the flag when the scan
 proves completion — this also heals the rare counter skew left by a process
 that died between setting the last bit and bumping the counter, as does the
-same reconciliation at every `open`. A successful `prefetch_all` additionally
+same reconciliation at every `open`. A successful prefetch that selected every
+group (`prefetch_all`, or image ranges covering the whole blob) additionally
 runs this authoritative scan before returning, so once a full prefetch
 completes, `is_all_ready` is guaranteed to answer true even in the presence of
 historical counter skew.

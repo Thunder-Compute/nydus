@@ -386,14 +386,14 @@ pub struct PrefetchConfig {
     pub concurrent_blob_count: usize,
 
     /// The per-blob prefetch timeout, e.g. `1h`: bounds how long prefetching
-    /// one whole blob may take, while `http.timeout` bounds each chunk group
-    /// request within it; `0s` disables the bound.
+    /// one blob's selected data may take, while `http.timeout` bounds each
+    /// chunk group request within it; `0s` disables the bound.
     #[serde(default = "default_prefetch_timeout", with = "humantime_serde")]
     pub timeout: Duration,
 
     /// The scope of blob prefetch: nothing, only the "ondemand" blob, all
-    /// blobs, or `auto` (the default): the "ondemand" blob when the image has
-    /// one, otherwise all blobs.
+    /// data the image reaches, or `auto` (the default): the "ondemand" blob
+    /// when the image has one, otherwise all data the image reaches.
     #[serde(default)]
     pub scope: PrefetchScope,
 
@@ -423,15 +423,19 @@ pub enum PrefetchScope {
     /// prefetched.
     Ondemand,
 
-    /// Pull all blobs: the priority blobs first, in declared order (an
-    /// optimized image lists its ondemand blob first), then every remaining
-    /// blob — the entire image ends up in the local cache.
+    /// Pull everything the mounted image can read: the "ondemand" blob
+    /// first, then, in the priority blobs (in declared order) and every
+    /// remaining blob, the chunk groups holding data of the files reachable
+    /// from the image root — the entire image ends up in the local cache.
+    /// Groups of a shared blob that no reachable file uses (data a layer
+    /// merge or deletion made unreachable, or that only other images use)
+    /// are not fetched.
     All,
 
     /// Decide per image once the blob metadata is available: [`Ondemand`]
     /// when a priority blob is an ondemand blob, otherwise [`All`], so an
     /// optimized image streams only its recorded working set while an
-    /// unoptimized one streams every blob like a classic nydusd mount.
+    /// unoptimized one streams all its data like a classic nydusd mount.
     ///
     /// [`Ondemand`]: PrefetchScope::Ondemand
     /// [`All`]: PrefetchScope::All

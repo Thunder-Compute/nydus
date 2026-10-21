@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io;
 use std::io::Write;
 
@@ -11,6 +12,7 @@ use nydus_format::erofs::{
     Z_EROFS_LI_D0_CBLKCNT, Z_EROFS_LI_LCLUSTER_TYPE_MASK, Z_EROFS_MAP_HEADER_SIZE,
 };
 use nydus_format::utils::align_up_usize;
+use nydus_storage::ranges::BlobRangesBuilder;
 
 use super::z_cache::PclusterKey;
 use super::{ErofsReader, RawBlobInfo};
@@ -210,6 +212,49 @@ impl ErofsReader {
             result.push(Self::chunk_index_entry_at(index_bytes, index)?.addr());
         }
         Ok(result)
+    }
+
+    /// Add the blob bytes a whole-file read of chunk-based inode `nid`
+    /// touches to `ranges`, keyed by blob index: each blob-backed chunk's
+    /// span, the last one only up to the file size, exactly as the read path
+    /// resolves them. Holes and bootstrap-local chunks need no fetch.
+    pub(super) fn collect_chunk_blob_ranges(
+        &self,
+        nid: u64,
+        inode: &ErofsInode<'_>,
+        ranges: &mut HashMap<u16, BlobRangesBuilder>,
+    ) -> io::Result<()> {
+        if inode.size() == 0 {
+            return Ok(());
+        }
+        let chunk_size = self.chunk_size(inode);
+        let index_bytes = self.chunk_index_bytes(nid, inode)?;
+        let nchunks = inode.size().div_ceil(chunk_size) as usize;
+        let blob_layout = self.blob_infos()?;
+        for_each_chunk_span(0, inode.size(), chunk_size, nchunks, |span| {
+            debug_assert_eq!(span.chunk_off, 0);
+            let entry = Self::chunk_index_entry_at(index_bytes, span.index)?;
+            let ChunkLocation::Blob { index, offset } =
+                locate_chunk(blob_layout, entry.blkaddr(), entry.device_id())?
+            else {
+                return Ok(());
+            };
+            if !blob_layout.iter().any(|info| info.blob_index == index) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "inode {nid} chunk {} names unknown blob {index}",
+                        span.index
+                    ),
+                ));
+            }
+            let end = offset.checked_add(span.len).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "chunk range overflow")
+            })?;
+            ranges.entry(index).or_default().push(offset..end);
+            Ok(())
+        })?;
+        Ok(())
     }
 
     // ------------------------------------------------------------------
