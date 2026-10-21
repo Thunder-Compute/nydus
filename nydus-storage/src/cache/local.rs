@@ -418,7 +418,23 @@ impl LocalBlobCache {
 
     /// Fill group `first` (and its window) into the cache file, joining an
     /// in-flight fill that already covers it.
+    ///
+    /// The caller reads the cache file right after this returns, so a
+    /// success that leaves `first` unpublished would hand it the file's
+    /// sparse zeros as data. Check that postcondition here, where leaders
+    /// and followers meet, and fail the read instead.
     fn ensure_chunk_group_window(&self, first: usize, cache_file: &File) -> io::Result<()> {
+        self.fill_or_join_chunk_group_window(first, cache_file)?;
+        if !self.chunk_group_ready(first)? {
+            return Err(io::Error::other(format!(
+                "chunk group {first} of blob {} is not ready after a successful fill",
+                self.blob_index
+            )));
+        }
+        Ok(())
+    }
+
+    fn fill_or_join_chunk_group_window(&self, first: usize, cache_file: &File) -> io::Result<()> {
         let (flight, window) = {
             let mut inflight = self.inflight.lock().unwrap();
             if let Some(flight) = inflight.get(&first) {
@@ -443,7 +459,13 @@ impl LocalBlobCache {
         };
 
         let result = (|| {
-            if self.chunk_group_ready(first)? {
+            // Success completes the flight for every group of the window, and
+            // a follower waiting on any of them reads its group straight
+            // after. So skip the fill only when the whole window is ready,
+            // not just `first`: the blob prefetcher and peer processes
+            // publish groups without taking flights, and may have filled
+            // `first` alone since the window was planned.
+            if self.chunk_group_map.is_range_ready(window.clone())? {
                 self.metrics.inc_cache_hit_chunk_group();
                 return Ok(());
             }
@@ -1885,5 +1907,123 @@ mod tests {
             .path()
             .join(format!("{}.blob.data", hex::encode(data_blob_id)))
             .exists());
+    }
+
+    /// `groups` single-block groups, group `i` filled with byte `i + 1`.
+    /// Returns the full blob id saved in `backend_dir` and the padded image.
+    fn single_block_groups_blob(
+        groups: usize,
+        backend_dir: &Path,
+    ) -> ([u8; SHA256_DIGEST_SIZE], Vec<u8>) {
+        let groups: Groups = (0..groups)
+            .map(|i| vec![vec![(i as u8).wrapping_add(1).max(1); 4096]])
+            .collect();
+        let (data, meta) = from_chunk_groups(BlobMetadataCompressor::None, 4096, &groups, None);
+        let full_blob_id = FullBlob::new(&data)
+            .with_blob_metadata(&meta)
+            .with_blob_metadata_file()
+            .save_in(backend_dir);
+        (full_blob_id, uncompressed_data(&groups))
+    }
+
+    /// A leader whose own group was published by someone else after the
+    /// window was planned (a peer process here, the blob prefetcher in the
+    /// same process) must still fill the rest of the window: its followers
+    /// are waiting on those groups and read them as soon as it succeeds.
+    #[test]
+    fn leader_fills_window_when_its_own_group_turns_ready() {
+        let _env = env_lock();
+        let backend_dir = tempdir().unwrap();
+        let (full_blob_id, image) = single_block_groups_blob(16, backend_dir.path());
+        let cache_dir = tempdir().unwrap();
+        let cached = open(
+            full_blob_id,
+            cache_dir.path(),
+            CountingBackend::new(backend_dir.path()),
+        );
+        let peer = open(
+            full_blob_id,
+            cache_dir.path(),
+            CountingBackend::new(backend_dir.path()),
+        );
+
+        super::super::set_fetch_size(0);
+        let mut buf = [0u8; 1];
+        peer.read_at(17, &mut buf).unwrap();
+        assert!(cached.is_chunk_group_ready(0));
+        assert!(!cached.is_chunk_group_ready(1));
+
+        // Group 0 was missing when this reader checked it; it leads a
+        // window over groups 0..8 and finds group 0 ready on entry.
+        super::super::set_fetch_size(8 * 4096);
+        let cache_file = cached.cache_file().unwrap();
+        cached
+            .ensure_chunk_group_window(0, cache_file.as_ref())
+            .unwrap();
+        for index in 0..8 {
+            assert!(
+                cached.is_chunk_group_ready(index),
+                "group {index} of the window is unfilled"
+            );
+        }
+        let mut window = vec![0u8; 8 * 4096];
+        cache_file.read_exact_at(&mut window, 0).unwrap();
+        assert_eq!(window, image[..8 * 4096]);
+    }
+
+    /// On-demand readers racing a prefetch of the same blob, run in this
+    /// handle or in a peer sharing the cache directory, read exactly the
+    /// image: no follower is woken before its group is published.
+    #[test]
+    fn readers_racing_prefetch_never_read_unfilled_groups() {
+        let _env = env_lock();
+        let backend_dir = tempdir().unwrap();
+        let groups = 64usize;
+        let (full_blob_id, image) = single_block_groups_blob(groups, backend_dir.path());
+        super::super::set_fetch_size(8 * 4096);
+        let wrong = AtomicUsize::new(0);
+        let errors = AtomicUsize::new(0);
+        for iter in 0..1000usize {
+            let cache_dir = tempdir().unwrap();
+            let cached = open(
+                full_blob_id,
+                cache_dir.path(),
+                CountingBackend::new(backend_dir.path()),
+            );
+            let peer = open(
+                full_blob_id,
+                cache_dir.path(),
+                CountingBackend::new(backend_dir.path()),
+            );
+            thread::scope(|s| {
+                let prefetcher = if iter % 2 == 0 { &cached } else { &peer };
+                s.spawn(move || prefetcher.prefetch_all(1, None).unwrap());
+                for reader in 0..16usize {
+                    let (cached, image, wrong, errors) = (&cached, &image, &wrong, &errors);
+                    s.spawn(move || {
+                        for k in 0..groups {
+                            let group = (k * 7 + reader * 13 + iter) % groups;
+                            let offset = group * 4096 + 17;
+                            let mut buf = [0u8; 1];
+                            match cached.read_at(offset as u64, &mut buf) {
+                                Ok(()) if buf[0] != image[offset] => {
+                                    wrong.fetch_add(1, Ordering::SeqCst);
+                                }
+                                Ok(()) => {}
+                                Err(_) => {
+                                    errors.fetch_add(1, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        assert_eq!(
+            wrong.load(Ordering::SeqCst),
+            0,
+            "reads returned wrong bytes"
+        );
+        assert_eq!(errors.load(Ordering::SeqCst), 0, "reads failed");
     }
 }
