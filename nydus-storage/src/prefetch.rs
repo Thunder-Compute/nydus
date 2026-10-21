@@ -1,7 +1,9 @@
-//! Post-mount blob prefetch: warms the local caches with the priority blobs
-//! declared in the image (and optionally every remaining blob) so on-demand
-//! reads hit the cache instead of the backend.
+//! Post-mount blob prefetch: warms the local caches with the ondemand blob
+//! declared in the image and, under the `all` scope, with the data the
+//! mounted image can reach, so on-demand reads hit the cache instead of the
+//! backend.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,6 +16,7 @@ use nydus_backend::is_backend_throttled;
 use nydus_config::PrefetchScope;
 
 use crate::cache::BlobCaches;
+use crate::ranges::BlobRanges;
 
 /// How often the reschedule wait re-checks the stop flag while sleeping
 /// towards the next deadline.
@@ -25,16 +28,19 @@ const RESCHEDULE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// 1. Resolve [`PrefetchScope::Auto`] from the priority blobs' metadata:
 ///    [`PrefetchScope::Ondemand`] when one of them is an "ondemand" (REDIRECT)
 ///    blob, otherwise [`PrefetchScope::All`].
-/// 2. Prefetch the blobs declared in the root `trusted.nydus.prefetch.blobs`
-///    xattr sequentially (single thread): the ondemand blobs first; under
-///    `ondemand` nothing else, under `all` the other priority blobs follow in
-///    declared order.
-/// 3. When the scope is [`PrefetchScope::All`], prefetch the remaining blobs
-///    concurrently with a worker pool; otherwise only open every blob's cache
-///    (blob meta, sparse files) in the background, alongside step 2, so the
-///    backend bandwidth stays focused on the access-ordered hot set (e.g. an
-///    optimized image's "ondemand" blob) while no later read pays the
-///    metadata round trips.
+/// 2. Stream the ondemand blobs declared in the root
+///    `trusted.nydus.prefetch.blobs` xattr sequentially (single thread) into
+///    their source blobs' caches. Under `ondemand` nothing else is pulled.
+/// 3. Under `all`, resolve the image's [`ImageExtents`] — the data its
+///    reachable files reference — then warm the chunk groups holding it: the
+///    other priority blobs sequentially in declared order, then the remaining
+///    blobs concurrently with a worker pool. Groups no reachable file needs
+///    (data that layer merges or deletions made unreachable, or that only
+///    other images sharing the blob use) are not fetched. Under the other
+///    scopes, only open every blob's cache (blob meta, sparse files) in the
+///    background, alongside step 2, so the backend bandwidth stays focused on
+///    the access-ordered hot set while no later read pays the metadata round
+///    trips.
 /// 4. Blobs whose prefetch the backend throttled (Dragonfly `429`, detected
 ///    via [`is_backend_throttled`]) are rescheduled after a random delay in
 ///    the configured window and re-attempted until they stop being throttled
@@ -44,6 +50,8 @@ pub struct BlobPrefetcher {
     caches: Arc<BlobCaches>,
     priority: Vec<u16>,
     rest: Vec<u16>,
+    /// Taken (and run, under `all`) once by [`run`](Self::run).
+    extents: Option<ImageExtentsResolver>,
     threads: usize,
     scope: PrefetchScope,
     /// Per-blob prefetch timeout; `0s` disables the bound.
@@ -57,14 +65,35 @@ pub struct BlobPrefetcher {
     stop: Arc<AtomicBool>,
 }
 
+/// The blob data a mounted image can read, which `all` prefetch warms.
+#[derive(Debug)]
+pub enum ImageExtents {
+    /// Per blob index, the decoded byte ranges that the image's reachable
+    /// regular files reference, each byte once however many hardlinks or
+    /// files share it. A blob without an entry holds no reachable data.
+    Reachable(HashMap<u16, BlobRanges>),
+    /// Every byte of every blob: the conservative superset, used when the
+    /// image's data is not resolved to ranges (z_erofs inodes, whose
+    /// pclusters live on native layers that prefetch never fetches anyway,
+    /// or a metadata walk that failed).
+    WholeBlobs,
+}
+
+/// Computes the [`ImageExtents`] of the mounted image. Run at most once, on
+/// the prefetch thread, so the metadata walk behind it never delays the
+/// mount or an ondemand-only prefetch.
+pub type ImageExtentsResolver = Box<dyn FnOnce() -> io::Result<ImageExtents> + Send>;
+
 /// The blob prefetch order: `priority` blobs stream first, sequentially and
 /// in declared order; `rest` follows through the worker pool when the scope
-/// is [`PrefetchScope::All`].
+/// is [`PrefetchScope::All`], which warms only what `extents` selects.
 pub struct PrefetchPlan {
     /// Blob indexes to warm first, in declared order.
     pub priority: Vec<u16>,
     /// The remaining blob indexes, in ascending order.
     pub rest: Vec<u16>,
+    /// The data of the plain (non-ondemand) blobs that `all` warms.
+    pub extents: ImageExtentsResolver,
 }
 
 impl BlobPrefetcher {
@@ -85,6 +114,7 @@ impl BlobPrefetcher {
             caches,
             priority: plan.priority,
             rest: plan.rest,
+            extents: Some(plan.extents),
             threads: threads.max(1),
             scope,
             timeout,
@@ -103,6 +133,38 @@ impl BlobPrefetcher {
 
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
+    }
+
+    /// Run the plan's extents resolver. A failed walk falls back to whole
+    /// blobs: warming too much is better than silently skipping data the
+    /// image needs.
+    fn resolve_extents(&mut self) -> ImageExtents {
+        let resolve = self
+            .extents
+            .take()
+            .expect("image extents are resolved once");
+        let start = Instant::now();
+        match resolve() {
+            Ok(ImageExtents::Reachable(blobs)) => {
+                info!(
+                    "image prefetch selects {} reachable bytes in {} blobs (resolved in {:.3?})",
+                    blobs.values().map(BlobRanges::len_bytes).sum::<u64>(),
+                    blobs.len(),
+                    start.elapsed(),
+                );
+                ImageExtents::Reachable(blobs)
+            }
+            Ok(ImageExtents::WholeBlobs) => {
+                info!("image data is not resolved to ranges, prefetching whole blobs");
+                ImageExtents::WholeBlobs
+            }
+            Err(err) => {
+                warn!(
+                    "failed to resolve the image's reachable data, prefetching whole blobs: {err}"
+                );
+                ImageExtents::WholeBlobs
+            }
+        }
     }
 
     /// Open every blob's cache on a small worker pool, priority blobs first,
@@ -153,12 +215,35 @@ impl BlobPrefetcher {
             .spawn(move || self.run())
     }
 
+    /// Prefetch one priority blob through `prefetch`, sequentially with the
+    /// full worker count, queueing it for a delayed retry when the backend
+    /// throttles it.
+    fn prefetch_priority_blob(
+        &self,
+        blob_index: u16,
+        throttled: &mut Vec<u16>,
+        prefetch: impl FnOnce(&BlobCaches) -> io::Result<()>,
+    ) {
+        match prefetch(&self.caches) {
+            Ok(()) => info!("prefetched priority blob {}", blob_index),
+            Err(err) if is_backend_throttled(&err) => {
+                self.caches.metrics().inc_prefetch_reschedule();
+                warn!(
+                    "backend throttled prefetch of priority blob {}, rescheduling: {}",
+                    blob_index, err
+                );
+                throttled.push(blob_index);
+            }
+            Err(err) => warn!("failed to prefetch priority blob {}: {}", blob_index, err),
+        }
+    }
+
     /// Drive the whole prefetch workflow synchronously on the calling thread:
     /// ondemand priority blobs first, then (only when the scope resolves to
-    /// [`PrefetchScope::All`]) the other priority blobs in declared order and
-    /// the remaining blobs through a worker pool, then delayed retries of
-    /// throttled blobs. Per-blob failures other than backend throttling are
-    /// logged and skipped.
+    /// [`PrefetchScope::All`]) the image's reachable data in the other
+    /// priority blobs in declared order and in the remaining blobs through a
+    /// worker pool, then delayed retries of throttled blobs. Per-blob
+    /// failures other than backend throttling are logged and skipped.
     pub fn run(mut self) {
         if self.scope == PrefetchScope::None {
             return;
@@ -212,41 +297,43 @@ impl BlobPrefetcher {
             return;
         }
 
-        // Phase 1: priority blobs, sequential. Ondemand blobs go first (they
+        // Phase 1a: ondemand priority blobs, sequential. They go first (they
         // stream the recorded working set into the source blobs' caches, so
-        // whole-blob pulls that follow skip the groups already filled); under
-        // "ondemand" they are the only blobs pulled, under "all" the other
-        // priority blobs follow in declared order.
+        // the image prefetch that follows skips the groups already filled),
+        // and under "ondemand" they are the only blobs pulled.
         let priority_with_flag = || self.priority.iter().copied().zip(ondemand.iter().copied());
-        let mut phase1: Vec<u16> = priority_with_flag()
-            .filter(|&(_, redirect)| redirect)
-            .map(|(index, _)| index)
-            .collect();
-        if scope == PrefetchScope::All {
-            phase1.extend(
-                priority_with_flag()
-                    .filter(|&(_, redirect)| !redirect)
-                    .map(|(index, _)| index),
-            );
-        }
-        for blob_index in phase1 {
+        let (redirect, plain): (Vec<_>, Vec<_>) =
+            priority_with_flag().partition(|&(_, redirect)| redirect);
+        for (blob_index, _) in redirect {
             if self.stopped() {
                 return;
             }
-            match self
-                .caches
-                .prefetch_blob(blob_index, self.threads, self.timeout)
-            {
-                Ok(()) => info!("prefetched priority blob {}", blob_index),
-                Err(err) if is_backend_throttled(&err) => {
-                    self.caches.metrics().inc_prefetch_reschedule();
-                    warn!(
-                        "backend throttled prefetch of priority blob {}, rescheduling: {}",
-                        blob_index, err
-                    );
-                    throttled.push(blob_index);
+            self.prefetch_priority_blob(blob_index, &mut throttled, |caches| {
+                caches.prefetch_blob(blob_index, self.threads, self.timeout)
+            });
+        }
+
+        // Only "all" walks the image metadata; under "ondemand" no plain blob
+        // data is reachable for prefetch, so retries of throttled ondemand
+        // blobs (which ignore the extents) are all that remains.
+        let extents = if scope == PrefetchScope::All {
+            self.resolve_extents()
+        } else {
+            drop(self.extents.take());
+            ImageExtents::Reachable(HashMap::new())
+        };
+        let extents = Arc::new(extents);
+
+        // Phase 1b: under "all", the image data in the other priority blobs,
+        // sequential and in declared order.
+        if scope == PrefetchScope::All {
+            for (blob_index, _) in plain {
+                if self.stopped() {
+                    return;
                 }
-                Err(err) => warn!("failed to prefetch priority blob {}: {}", blob_index, err),
+                self.prefetch_priority_blob(blob_index, &mut throttled, |caches| {
+                    caches.prefetch_image_blob(blob_index, &extents, self.threads, self.timeout)
+                });
             }
         }
 
@@ -254,8 +341,8 @@ impl BlobPrefetcher {
             let _ = handle.join();
         }
 
-        // Phase 2: remaining blobs, concurrent worker pool. Skipped unless the
-        // scope resolved to "all".
+        // Phase 2: the image data in the remaining blobs, concurrent worker
+        // pool. Skipped unless the scope resolved to "all".
         if scope == PrefetchScope::All && !self.rest.is_empty() {
             let worker_count = self.threads.min(self.rest.len());
             let queue = Arc::new(Mutex::new(std::mem::take(&mut self.rest)));
@@ -267,6 +354,7 @@ impl BlobPrefetcher {
                 let queue = queue.clone();
                 let throttled_shared = throttled_shared.clone();
                 let stop = self.stop.clone();
+                let extents = extents.clone();
                 let handle = thread::Builder::new()
                     .name("nydus_prefetch_worker".to_string())
                     .spawn(move || loop {
@@ -278,20 +366,22 @@ impl BlobPrefetcher {
                             guard.pop()
                         };
                         match blob_index {
-                            Some(blob_index) => match blobs.prefetch_blob(blob_index, 1, timeout) {
-                                Ok(()) => info!("prefetched blob {}", blob_index),
-                                Err(err) if is_backend_throttled(&err) => {
-                                    blobs.metrics().inc_prefetch_reschedule();
-                                    warn!(
-                                        "backend throttled prefetch of blob {}, rescheduling: {}",
-                                        blob_index, err
-                                    );
-                                    throttled_shared.lock().unwrap().push(blob_index);
+                            Some(blob_index) => {
+                                match blobs.prefetch_image_blob(blob_index, &extents, 1, timeout) {
+                                    Ok(()) => info!("prefetched blob {}", blob_index),
+                                    Err(err) if is_backend_throttled(&err) => {
+                                        blobs.metrics().inc_prefetch_reschedule();
+                                        warn!(
+                                            "backend throttled prefetch of blob {}, rescheduling: {}",
+                                            blob_index, err
+                                        );
+                                        throttled_shared.lock().unwrap().push(blob_index);
+                                    }
+                                    Err(err) => {
+                                        warn!("failed to prefetch blob {}: {}", blob_index, err)
+                                    }
                                 }
-                                Err(err) => {
-                                    warn!("failed to prefetch blob {}: {}", blob_index, err)
-                                }
-                            },
+                            }
                             None => break,
                         }
                     });
@@ -309,8 +399,9 @@ impl BlobPrefetcher {
         // Phase 3: delayed retries of throttled blobs. Each blob gets a fresh
         // random deadline inside the retry window; retries that get throttled
         // again are rescheduled, other failures are dropped. The cross-process
-        // prefetch flock and group-map skip logic inside `prefetch_blob` make
-        // a rescheduled prefetch behind another node's progress nearly free.
+        // prefetch flock and group-map skip logic inside the blob prefetch
+        // make a rescheduled prefetch behind another node's progress nearly
+        // free.
         let mut queue: Vec<(Instant, u16)> = throttled
             .into_iter()
             .map(|blob_index| (Instant::now() + self.retry_delay(), blob_index))
@@ -331,7 +422,7 @@ impl BlobPrefetcher {
             self.caches.metrics().inc_prefetch_reschedule_run();
             match self
                 .caches
-                .prefetch_blob(blob_index, self.threads, self.timeout)
+                .prefetch_image_blob(blob_index, &extents, self.threads, self.timeout)
             {
                 Ok(()) => info!("prefetched rescheduled blob {}", blob_index),
                 Err(err) if is_backend_throttled(&err) => {
@@ -443,16 +534,25 @@ mod tests {
         );
         BlobPrefetcher::new(
             caches,
-            PrefetchPlan {
-                priority: vec![0],
-                rest: Vec::new(),
-            },
+            whole_blobs(vec![0], Vec::new()),
             1,
             PrefetchScope::All,
             Duration::ZERO,
             Duration::from_millis(30),
             Duration::from_millis(60),
         )
+    }
+
+    fn plan(priority: Vec<u16>, rest: Vec<u16>, extents: ImageExtents) -> PrefetchPlan {
+        PrefetchPlan {
+            priority,
+            rest,
+            extents: Box::new(move || Ok(extents)),
+        }
+    }
+
+    fn whole_blobs(priority: Vec<u16>, rest: Vec<u16>) -> PrefetchPlan {
+        plan(priority, rest, ImageExtents::WholeBlobs)
     }
 
     fn test_payload() -> (Vec<u8>, BlobMetadata) {
@@ -633,26 +733,17 @@ mod tests {
 
     #[test]
     fn scope_none_pulls_nothing_even_with_an_ondemand_blob() {
-        let plan = PrefetchPlan {
-            priority: vec![2, 1],
-            rest: Vec::new(),
-        };
+        let plan = whole_blobs(vec![2, 1], Vec::new());
         assert!(blobs_read(PrefetchScope::None, plan).is_empty());
     }
 
     #[test]
     fn scope_ondemand_streams_only_the_ondemand_blob() {
-        let plan = PrefetchPlan {
-            priority: vec![2, 1],
-            rest: Vec::new(),
-        };
+        let plan = whole_blobs(vec![2, 1], Vec::new());
         // The redirect stream fills blob 1's cache from blob 2's data; blob 1
         // itself is never read from the backend.
         assert_eq!(blobs_read(PrefetchScope::Ondemand, plan), vec![2]);
-        let plan = PrefetchPlan {
-            priority: vec![1],
-            rest: vec![2],
-        };
+        let plan = whole_blobs(vec![1], vec![2]);
         // No ondemand blob among the priority blobs: nothing is pulled.
         assert!(blobs_read(PrefetchScope::Ondemand, plan).is_empty());
     }
@@ -661,25 +752,61 @@ mod tests {
     fn scope_all_streams_the_ondemand_blob_before_the_others() {
         // Declared order puts the plain blob first; the ondemand blob is
         // still streamed first, then the plain blob's remaining groups.
-        let plan = PrefetchPlan {
-            priority: vec![1, 2],
-            rest: Vec::new(),
-        };
+        let plan = whole_blobs(vec![1, 2], Vec::new());
         let read = blobs_read(PrefetchScope::All, plan);
         assert_eq!(read.first(), Some(&2), "reads: {read:?}");
     }
 
     #[test]
     fn scope_auto_picks_ondemand_with_an_ondemand_blob_and_all_without() {
-        let plan = PrefetchPlan {
-            priority: vec![2, 1],
-            rest: Vec::new(),
-        };
+        let plan = whole_blobs(vec![2, 1], Vec::new());
         assert_eq!(blobs_read(PrefetchScope::Auto, plan), vec![2]);
+        let plan = whole_blobs(vec![1], Vec::new());
+        assert_eq!(blobs_read(PrefetchScope::Auto, plan), vec![1]);
+    }
+
+    #[test]
+    fn scope_all_warms_only_blobs_with_reachable_data() {
+        // Blob 1 holds no data the image reaches: nothing is pulled.
+        let unreachable = plan(vec![1], Vec::new(), ImageExtents::Reachable(HashMap::new()));
+        assert!(blobs_read(PrefetchScope::All, unreachable).is_empty());
+        let reachable = plan(
+            Vec::new(),
+            vec![1],
+            ImageExtents::Reachable(HashMap::from([(1, std::iter::once(0..100).collect())])),
+        );
+        assert_eq!(blobs_read(PrefetchScope::All, reachable), vec![1]);
+    }
+
+    #[test]
+    fn failed_extents_walk_falls_back_to_whole_blobs() {
         let plan = PrefetchPlan {
             priority: vec![1],
             rest: Vec::new(),
+            extents: Box::new(|| Err(io::Error::other("corrupt inode"))),
         };
-        assert_eq!(blobs_read(PrefetchScope::Auto, plan), vec![1]);
+        assert_eq!(blobs_read(PrefetchScope::All, plan), vec![1]);
+    }
+
+    #[test]
+    fn only_scope_all_walks_the_image() {
+        for scope in [
+            PrefetchScope::None,
+            PrefetchScope::Ondemand,
+            PrefetchScope::Auto,
+        ] {
+            let walked = Arc::new(AtomicBool::new(false));
+            let flag = walked.clone();
+            let plan = PrefetchPlan {
+                priority: vec![2, 1],
+                rest: Vec::new(),
+                extents: Box::new(move || {
+                    flag.store(true, Ordering::SeqCst);
+                    Ok(ImageExtents::WholeBlobs)
+                }),
+            };
+            blobs_read(scope, plan);
+            assert!(!walked.load(Ordering::SeqCst), "{scope:?} walked the image");
+        }
     }
 }

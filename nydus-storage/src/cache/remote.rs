@@ -19,6 +19,7 @@ use nydus_format::utils::SHA256_DIGEST_SIZE;
 use nydus_telemetry::metrics::ImageMetrics;
 
 use super::{decode_chunk_group_into, validate_chunk_group_for_image, BlobCache, ChunkGroupBuffer};
+use crate::ranges::BlobRanges;
 
 /// Decoded bytes the diskless caches of one blob set keep in memory.
 const DECODED_GROUP_CACHE_BYTES: usize = 32 << 20;
@@ -273,6 +274,16 @@ impl BlobCache for RemoteBlobCache {
             io::ErrorKind::Unsupported,
             "prefetch requires a storage directory: diskless reads have no cache to warm",
         ))
+    }
+
+    /// Unsupported, like [`prefetch_all`](BlobCache::prefetch_all).
+    fn prefetch_ranges(
+        &self,
+        _ranges: &BlobRanges,
+        workers: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> io::Result<()> {
+        self.prefetch_all(workers, deadline)
     }
 
     fn is_redirect(&self) -> bool {

@@ -1,5 +1,6 @@
 pub(crate) mod data;
 mod metadata;
+mod reachable;
 mod z_cache;
 
 use std::collections::HashSet;
@@ -455,8 +456,10 @@ impl ErofsReader {
 
     /// Build the blob prefetch plan: blobs listed in the root prefetch xattr (in
     /// order, deduplicated, filtered to existing blobs), followed by the
-    /// remaining blob indexes in ascending order.
-    pub fn prefetch_plan(&self) -> PrefetchPlan {
+    /// remaining blob indexes in ascending order, plus a resolver for the
+    /// image's [`reachable_extents`](Self::reachable_extents), which the
+    /// prefetcher runs on its own thread when the scope resolves to `all`.
+    pub fn prefetch_plan(self: &Arc<Self>) -> PrefetchPlan {
         let mut ordered = Vec::new();
         let mut seen = HashSet::new();
         for blob_index in self.read_prefetch_order() {
@@ -470,9 +473,11 @@ impl ErofsReader {
             .filter(|id| !seen.contains(id))
             .collect();
         rest.sort_unstable();
+        let reader = self.clone();
         PrefetchPlan {
             priority: ordered,
             rest,
+            extents: Box::new(move || reader.reachable_extents()),
         }
     }
 

@@ -18,6 +18,8 @@ use nydus_format::blob::{
 };
 use nydus_telemetry::metrics::ImageMetrics;
 
+use crate::ranges::BlobRanges;
+
 /// Default on-demand fetch size: the compressed bytes one backend read
 /// covers around a missed chunk group (see [`set_fetch_size`]). 2 MiB.
 pub const DEFAULT_FETCH_SIZE: u64 = 2 * 1024 * 1024;
@@ -65,6 +67,18 @@ pub trait BlobCache: Send + Sync {
     /// Up to `workers` batches are fetched concurrently. Aborts with
     /// [`io::ErrorKind::TimedOut`] when `deadline` passes between batches.
     fn prefetch_all(&self, workers: usize, deadline: Option<Instant>) -> io::Result<()>;
+
+    /// Like [`prefetch_all`](Self::prefetch_all), restricted to the chunk
+    /// groups overlapping `ranges` of the decoded address space: the groups
+    /// an image's reachable files need. Consecutive selected groups share a
+    /// backend read; a group no range touches is never fetched, even when it
+    /// lies between selected ones.
+    fn prefetch_ranges(
+        &self,
+        ranges: &BlobRanges,
+        workers: usize,
+        deadline: Option<Instant>,
+    ) -> io::Result<()>;
 
     /// Create (or open) this blob's cache data file sized to the padded
     /// uncompressed address space and return its path. The file mirrors the
@@ -178,30 +192,58 @@ pub fn plan_prefetch_batches(
     target_compressed: u64,
     ramp: usize,
 ) -> Vec<Range<usize>> {
+    let all = 0..blob_metadata.chunk_group_count();
+    let runs = if all.is_empty() {
+        &[][..]
+    } else {
+        std::slice::from_ref(&all)
+    };
+    plan_prefetch_batches_in(blob_metadata, runs, target_compressed, ramp)
+}
+
+/// [`plan_prefetch_batches`] over a subset of the groups: `runs` are sorted,
+/// disjoint, non-empty group index ranges, and no batch spans two runs, so
+/// the groups between runs are never read.
+pub fn plan_prefetch_batches_in(
+    blob_metadata: &BlobMetadata,
+    runs: &[Range<usize>],
+    target_compressed: u64,
+    ramp: usize,
+) -> Vec<Range<usize>> {
     let count = blob_metadata.chunk_group_count();
     let mut batches = Vec::new();
-    let mut start = 0usize;
-    while start < count && start < ramp {
-        batches.push(start..start + 1);
-        start += 1;
-    }
-    while start < count {
-        let base = blob_metadata
-            .chunk_group(start)
-            .expect("group index within the table")
-            .compressed_offset();
-        let mut end = start + 1;
-        while end < count {
-            let group = blob_metadata
-                .chunk_group(end)
-                .expect("group index within the table");
-            if group.compressed_range().end - base > target_compressed {
-                break;
-            }
-            end += 1;
+    let mut ramp_left = ramp;
+    let mut previous_end = 0usize;
+    for run in runs {
+        assert!(
+            run.start < run.end && run.end <= count && run.start >= previous_end,
+            "prefetch runs must be sorted, disjoint and within the blob: {run:?} after {previous_end}"
+        );
+        previous_end = run.end;
+        let mut start = run.start;
+        while start < run.end && ramp_left > 0 {
+            batches.push(start..start + 1);
+            start += 1;
+            ramp_left -= 1;
         }
-        batches.push(start..end);
-        start = end;
+        while start < run.end {
+            let base = blob_metadata
+                .chunk_group(start)
+                .expect("group index within the table")
+                .compressed_offset();
+            let mut end = start + 1;
+            while end < run.end {
+                let group = blob_metadata
+                    .chunk_group(end)
+                    .expect("group index within the table");
+                if group.compressed_range().end - base > target_compressed {
+                    break;
+                }
+                end += 1;
+            }
+            batches.push(start..end);
+            start = end;
+        }
     }
     batches
 }
@@ -838,6 +880,26 @@ mod tests {
         );
         let (_, empty) = from_chunk_groups(BlobMetadataCompressor::None, 4096, &[], None);
         assert!(plan_prefetch_batches(&empty, 4096, 4).is_empty());
+    }
+
+    #[test]
+    fn prefetch_batches_never_span_unselected_groups() {
+        let groups: Vec<Vec<Vec<u8>>> = (0..6u8).map(|i| vec![vec![i; 4096]]).collect();
+        let (_, metadata) = from_chunk_groups(BlobMetadataCompressor::None, 4096, &groups, None);
+        assert_eq!(
+            plan_prefetch_batches_in(&metadata, &[0..2, 3..6], u64::MAX, 0),
+            vec![0..2, 3..6]
+        );
+        assert_eq!(
+            plan_prefetch_batches_in(&metadata, &[0..2, 3..6], 8192, 0),
+            vec![0..2, 3..5, 5..6]
+        );
+        // The ramp counts selected groups across runs.
+        assert_eq!(
+            plan_prefetch_batches_in(&metadata, &[1..2, 4..6], u64::MAX, 2),
+            vec![1..2, 4..5, 5..6]
+        );
+        assert!(plan_prefetch_batches_in(&metadata, &[], u64::MAX, 2).is_empty());
     }
 
     /// A backend whose reads are never exercised; only its static target matters.
