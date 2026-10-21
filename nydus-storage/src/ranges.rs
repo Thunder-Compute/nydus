@@ -33,9 +33,11 @@ impl BlobRanges {
 pub struct BlobRangesBuilder(Vec<Range<u64>>);
 
 impl BlobRangesBuilder {
-    /// Add `range`; empty ranges are ignored.
+    /// Add `range`; empty ranges are ignored. Panics on a reversed range,
+    /// which can only come from a caller swapping its endpoints.
     pub fn push(&mut self, range: Range<u64>) {
-        if range.start >= range.end {
+        assert!(range.start <= range.end, "reversed blob range {range:?}");
+        if range.start == range.end {
             return;
         }
         match self.0.last_mut() {
@@ -85,5 +87,12 @@ mod tests {
         assert_eq!(ranges.as_slice(), &[0..6, 8..9, 10..25, 40..50]);
         assert_eq!(ranges.len_bytes(), 6 + 1 + 15 + 10);
         assert!(BlobRanges::from_iter(std::iter::once(5..5)).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "reversed blob range")]
+    fn reversed_range_panics() {
+        #[allow(clippy::reversed_empty_ranges)]
+        BlobRangesBuilder::default().push(9..5);
     }
 }

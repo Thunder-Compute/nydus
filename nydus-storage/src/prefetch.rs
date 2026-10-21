@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use nydus_backend::is_backend_throttled;
 use nydus_config::PrefetchScope;
 
-use crate::cache::BlobCaches;
+use crate::cache::{BlobCaches, GroupSelection};
 use crate::ranges::BlobRanges;
 
 /// How often the reschedule wait re-checks the stop flag while sleeping
@@ -77,6 +77,22 @@ pub enum ImageExtents {
     /// pclusters live on native layers that prefetch never fetches anyway,
     /// or a metadata walk that failed).
     WholeBlobs,
+}
+
+impl ImageExtents {
+    /// The chunk groups of the blob identified by `blob_index` that hold
+    /// image data: under [`Reachable`](Self::Reachable) only those its
+    /// reachable files reference (none for a blob without an entry), under
+    /// [`WholeBlobs`](Self::WholeBlobs) every group.
+    pub fn selection(&self, blob_index: u16) -> GroupSelection<'_> {
+        match self {
+            ImageExtents::WholeBlobs => GroupSelection::All,
+            ImageExtents::Reachable(blobs) => match blobs.get(&blob_index) {
+                Some(ranges) if !ranges.is_empty() => GroupSelection::Ranges(ranges),
+                _ => GroupSelection::None,
+            },
+        }
+    }
 }
 
 /// Computes the [`ImageExtents`] of the mounted image. Run at most once, on
@@ -301,9 +317,12 @@ impl BlobPrefetcher {
         // stream the recorded working set into the source blobs' caches, so
         // the image prefetch that follows skips the groups already filled),
         // and under "ondemand" they are the only blobs pulled.
-        let priority_with_flag = || self.priority.iter().copied().zip(ondemand.iter().copied());
-        let (redirect, plain): (Vec<_>, Vec<_>) =
-            priority_with_flag().partition(|&(_, redirect)| redirect);
+        let (redirect, plain): (Vec<_>, Vec<_>) = self
+            .priority
+            .iter()
+            .copied()
+            .zip(ondemand.iter().copied())
+            .partition(|&(_, redirect)| redirect);
         for (blob_index, _) in redirect {
             if self.stopped() {
                 return;
@@ -332,7 +351,12 @@ impl BlobPrefetcher {
                     return;
                 }
                 self.prefetch_priority_blob(blob_index, &mut throttled, |caches| {
-                    caches.prefetch_image_blob(blob_index, &extents, self.threads, self.timeout)
+                    caches.prefetch_blob_groups(
+                        blob_index,
+                        extents.selection(blob_index),
+                        self.threads,
+                        self.timeout,
+                    )
                 });
             }
         }
@@ -367,7 +391,12 @@ impl BlobPrefetcher {
                         };
                         match blob_index {
                             Some(blob_index) => {
-                                match blobs.prefetch_image_blob(blob_index, &extents, 1, timeout) {
+                                match blobs.prefetch_blob_groups(
+                                    blob_index,
+                                    extents.selection(blob_index),
+                                    1,
+                                    timeout,
+                                ) {
                                     Ok(()) => info!("prefetched blob {}", blob_index),
                                     Err(err) if is_backend_throttled(&err) => {
                                         blobs.metrics().inc_prefetch_reschedule();
@@ -420,10 +449,12 @@ impl BlobPrefetcher {
                 return;
             }
             self.caches.metrics().inc_prefetch_reschedule_run();
-            match self
-                .caches
-                .prefetch_image_blob(blob_index, &extents, self.threads, self.timeout)
-            {
+            match self.caches.prefetch_blob_groups(
+                blob_index,
+                extents.selection(blob_index),
+                self.threads,
+                self.timeout,
+            ) {
                 Ok(()) => info!("prefetched rescheduled blob {}", blob_index),
                 Err(err) if is_backend_throttled(&err) => {
                     self.caches.metrics().inc_prefetch_reschedule();

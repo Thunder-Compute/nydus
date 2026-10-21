@@ -37,7 +37,7 @@ pub(crate) fn check_prefetch_deadline(deadline: Option<Instant>) -> io::Result<(
     }
 }
 
-pub use caches::BlobCaches;
+pub use caches::{BlobCaches, GroupSelection};
 pub use local::LocalBlobCache;
 pub use raw::RawDeviceBlobCache;
 pub use remote::RemoteBlobCache;
@@ -204,7 +204,7 @@ pub fn plan_prefetch_batches(
 /// [`plan_prefetch_batches`] over a subset of the groups: `runs` are sorted,
 /// disjoint, non-empty group index ranges, and no batch spans two runs, so
 /// the groups between runs are never read.
-pub fn plan_prefetch_batches_in(
+fn plan_prefetch_batches_in(
     blob_metadata: &BlobMetadata,
     runs: &[Range<usize>],
     target_compressed: u64,

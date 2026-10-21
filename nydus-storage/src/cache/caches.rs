@@ -21,11 +21,10 @@ use nydus_telemetry::metrics::ImageMetrics;
 
 use super::remote::DecodedGroupCache;
 use super::{BlobCache, LocalBlobCache, RawDeviceBlobCache, RemoteBlobCache};
-use crate::prefetch::ImageExtents;
 use crate::ranges::BlobRanges;
 
 /// Which chunk groups of a plain (non-REDIRECT) blob a prefetch fills.
-enum GroupSelection<'a> {
+pub enum GroupSelection<'a> {
     All,
     /// The groups overlapping these decoded ranges.
     Ranges(&'a BlobRanges),
@@ -207,31 +206,11 @@ impl BlobCaches {
     }
 
     /// Prefetch the chunk groups of the blob identified by `blob_index` that
-    /// `extents` selects for the mounted image: with
-    /// [`ImageExtents::Reachable`] only the groups holding data its reachable
-    /// files reference (none for a blob without an entry), with
-    /// [`ImageExtents::WholeBlobs`] every group. An "ondemand" (REDIRECT)
-    /// blob is never addressed by the filesystem and is streamed into its
-    /// sources as by [`prefetch_blob`](Self::prefetch_blob) either way.
+    /// `selection` picks. An "ondemand" (REDIRECT) blob is never addressed by
+    /// the filesystem and is streamed into its sources as by
+    /// [`prefetch_blob`](Self::prefetch_blob) whatever the selection.
     /// Workers and timeout as for [`prefetch_blob`](Self::prefetch_blob).
-    pub fn prefetch_image_blob(
-        &self,
-        blob_index: u16,
-        extents: &ImageExtents,
-        workers: usize,
-        timeout: Duration,
-    ) -> io::Result<()> {
-        let selection = match extents {
-            ImageExtents::WholeBlobs => GroupSelection::All,
-            ImageExtents::Reachable(blobs) => match blobs.get(&blob_index) {
-                Some(ranges) if !ranges.is_empty() => GroupSelection::Ranges(ranges),
-                _ => GroupSelection::None,
-            },
-        };
-        self.prefetch_blob_groups(blob_index, selection, workers, timeout)
-    }
-
-    fn prefetch_blob_groups(
+    pub fn prefetch_blob_groups(
         &self,
         blob_index: u16,
         selection: GroupSelection<'_>,
