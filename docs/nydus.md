@@ -76,9 +76,10 @@ schema: `version` is the builder version string (`<package version>-<git
 commit>`), `bootstrap` the standalone bootstrap path (empty without
 `--bootstrap`), `blobs` lists **all** required blobs with this build's output
 first (reused dictionary blobs included), `external_bootstrap` and
-`external_blobs` stay empty, `fs_version` is `"6"`, and `compressor` names the
-data compression algorithm (`none`, `zstd`, `lz4_block`; the native `erofs-*`
-layouts name their pcluster algorithm). `trace.registered_events` carries the
+`external_blobs` stay empty, `fs_version` is `"7"` (the pure-EROFS format; v2
+reports `"5"` or `"6"`), and `compressor` names the data compression algorithm
+(`none`, `zstd`, `lz4_block`; the native `erofs-*` layouts name their pcluster
+algorithm). `trace.registered_events` carries the
 counters, each present only once nonzero, as in v2:
 `blob_uncompressed_size` is the uncompressed size of the data the build wrote
 (absent for native layers, which carry no blob meta, and when every chunk was

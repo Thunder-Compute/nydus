@@ -565,7 +565,9 @@ struct BuildManifest {
     external_bootstrap: String,
     external_blobs: Vec<String>,
     trace: BuildManifestTrace,
-    /// The filesystem format generation; v3 is EROFS-only, v2's "6".
+    /// The filesystem format generation: "7", the pure-EROFS layout v3
+    /// builds (v2 reports "5" or "6" for its RAFS versions, which v3 cannot
+    /// read).
     fs_version: String,
     /// The data compression algorithm (see [`Compressor::manifest_name`]).
     compressor: String,
@@ -621,7 +623,7 @@ impl BuildManifest {
             external_bootstrap: String::new(),
             external_blobs: Vec::new(),
             trace: BuildManifestTrace { registered_events },
-            fs_version: "6".to_string(),
+            fs_version: "7".to_string(),
             compressor: command.compressor.manifest_name().to_string(),
         }
     }
@@ -1347,7 +1349,7 @@ mod tests {
         assert_eq!(raw["bootstrap"], bootstrap.display().to_string());
         assert_eq!(raw["external_bootstrap"], "");
         assert_eq!(raw["external_blobs"], serde_json::json!([]));
-        assert_eq!(raw["fs_version"], "6");
+        assert_eq!(raw["fs_version"], "7");
         assert_eq!(raw["compressor"], "zstd");
         assert_eq!(raw["trace"].as_object().unwrap().len(), 1);
 
