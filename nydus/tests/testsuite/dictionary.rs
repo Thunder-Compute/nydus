@@ -357,9 +357,17 @@ fn dictionary_cli_build_manifest_and_snapshot() {
         "--output-json",
         "a.json",
     ]);
+    // The manifest uses the v2 `nydus-image create --output-json` schema. (by Kimi K3)
     let first: serde_json::Value =
         serde_json::from_slice(&fs::read(dir.path().join("a.json")).unwrap()).unwrap();
-    let id = first["new_blob"].as_str().unwrap();
+    assert!(first["version"].is_string());
+    let first_blobs = first["blobs"].as_array().unwrap();
+    assert_eq!(first_blobs.len(), 1);
+    let id = first_blobs[0].as_str().unwrap();
+    let first_events = &first["trace"]["registered_events"];
+    assert_eq!(first_events["blob_uncompressed_size"], 9000);
+    assert!(first_events.get("dedup_chunks").is_none());
+    assert!(first_events.get("dedup_uncompressed_size").is_none());
     run(&[
         "dictionary",
         "add",
@@ -381,8 +389,12 @@ fn dictionary_cli_build_manifest_and_snapshot() {
     ]);
     let second: serde_json::Value =
         serde_json::from_slice(&fs::read(dir.path().join("b.json")).unwrap()).unwrap();
-    assert_eq!(second["new_data_bytes"], 0);
-    assert_eq!(second["deduplicated_bytes"], 9000);
+    let second_events = &second["trace"]["registered_events"];
+    assert_eq!(second_events["dedup_chunks"], 1);
+    assert_eq!(second_events["dedup_uncompressed_size"], 9000);
+    // A fully reused build writes no new data, so, as in v2, the counter is
+    // absent rather than zero. (by Kimi K3)
+    assert!(second_events.get("blob_uncompressed_size").is_none());
     assert!(second["blobs"]
         .as_array()
         .unwrap()

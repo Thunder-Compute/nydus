@@ -71,12 +71,22 @@ nydus build rootfs-b --blob-dir blobs --bootstrap b.boot \
 nydus dictionary info /catalogs/org-a
 ```
 
-The JSON build manifest lists **all** required blobs in `blobs`, identifies the
-new output in `new_blob`, and reports `new_data_bytes` (compressed),
-`deduplicated_bytes` (uncompressed), and `deduplicated_chunks`. Repeated chunks
-within a dictionary-enabled build also reuse their first placement. Zero chunks
-remain holes, and hardlinks share their inode. A completely reused image still
-emits a metadata-bearing full blob with an empty data region.
+The JSON build manifest uses the nydus v2 `nydus-image create --output-json`
+schema: `version` is the builder version string (`<package version>-<git
+commit>`), `bootstrap` the standalone bootstrap path (empty without
+`--bootstrap`), `blobs` lists **all** required blobs with this build's output
+first (reused dictionary blobs included), `external_bootstrap` and
+`external_blobs` stay empty, `fs_version` is `"6"`, and `compressor` names the
+data compression algorithm (`none`, `zstd`, `lz4_block`; the native `erofs-*`
+layouts name their pcluster algorithm). `trace.registered_events` carries the
+counters, each present only once nonzero, as in v2:
+`blob_uncompressed_size` is the uncompressed size of the data the build wrote
+(absent for native layers, which carry no blob meta, and when every chunk was
+reused), and `dedup_uncompressed_size` and `dedup_chunks` count the bytes and
+chunks reused from the dictionary. Repeated chunks within a dictionary-enabled
+build also reuse their first placement. Zero chunks remain holes, and
+hardlinks share their inode. A completely reused image still emits a
+metadata-bearing full blob with an empty data region.
 
 `dictionary add` hashes the full blob to obtain its content address, decodes and
 CRC-checks each physical chunk group, and indexes its individual members. It
