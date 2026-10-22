@@ -5,15 +5,19 @@
 //! [`build_image`] is the high-level entry point that converts a
 //! directory tree into a nydus full blob.
 
+pub mod dictionary;
 pub mod merge;
 pub mod tar;
 mod tar_normalize;
 
 pub use nydus_core::build::{blob_metadata_sidecar_path, save_blob_metadata_sidecar};
 
+use nydus_core::build::dictionary::{ChunkDictionary, DedupStats};
+use nydus_core::BlobId;
 use std::collections::HashSet;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
@@ -62,6 +66,7 @@ pub struct BuildImageOptions {
     /// Source directory to convert. Should be canonicalized so entries match
     /// against `exclude`.
     source: PathBuf,
+    dictionary: Option<Arc<dyn ChunkDictionary>>,
     /// File chunk size in bytes (a power of two, >= the block size, and
     /// block-aligned).
     chunk_size: u32,
@@ -107,6 +112,9 @@ pub struct Image {
     pub blob_footer: BlobFooter,
     /// Rendered when requested, for the caller to persist.
     pub standalone_bootstrap: Option<Vec<u8>>,
+    /// Required full-blob IDs, with this build's output first.
+    pub referenced_blobs: Vec<BlobId>,
+    pub dedup_stats: DedupStats,
 }
 
 /// Implement BuildImageOptions.
@@ -142,6 +150,7 @@ impl BuildImageOptions {
 
         Ok(Self {
             source,
+            dictionary: None,
             chunk_size,
             chunk_group_min_size: DEFAULT_CHUNK_GROUP_MIN_SIZE,
             compressor,
@@ -152,6 +161,22 @@ impl BuildImageOptions {
             native: None,
             z_data_alignment: 0,
         })
+    }
+
+    pub fn with_dictionary(mut self, dictionary: Arc<dyn ChunkDictionary>) -> Result<Self> {
+        self.dictionary = Some(dictionary);
+        self.validate_dictionary()?;
+        Ok(self)
+    }
+
+    fn validate_dictionary(&self) -> Result<()> {
+        if self.dictionary.is_some() && (self.native.is_some() || self.blob_id.is_some()) {
+            return Err(Error::InvalidParameter(
+                "chunk dictionaries require chunk-group output and content-addressed blob IDs"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Sets the chunk group minimum size: a power of two between one block
@@ -178,7 +203,7 @@ impl BuildImageOptions {
         self.chunk_group_min_size
     }
 
-    /// Selects the chunk digest algorithm; `None` skips chunk hashing.
+    /// Selects the group digest algorithm; dictionary keys are hashed independently.
     pub fn with_digester(mut self, digester: Option<BlobMetadataDigester>) -> Self {
         self.digester = digester;
         self
@@ -235,6 +260,7 @@ impl BuildImageOptions {
 /// groups, or the raw layer device with [`BuildImageOptions::with_native`]
 /// (then without a blob meta region).
 pub fn build_image(options: &BuildImageOptions, writer: impl Write) -> Result<Image> {
+    options.validate_dictionary()?;
     match options.native {
         Some(NativeLayout::Compressed(_)) => {
             let mut blob_writer = options.z_blob_writer(writer)?;
@@ -267,6 +293,7 @@ pub fn build_image_from_tar_layer(
     layer: &Path,
     writer: impl Write,
 ) -> Result<Image> {
+    options.validate_dictionary()?;
     match options.native {
         Some(NativeLayout::Compressed(_)) => {
             let mut blob_writer = options.z_blob_writer(writer)?;
@@ -335,14 +362,18 @@ impl BuildImageOptions {
                 chunk_group_min_size: self.chunk_group_min_size,
             }
         };
-        BlobWriter::new(
+        let writer = BlobWriter::new(
             writer,
             self.chunk_size,
             self.compressor,
             self.digester,
             self.blob_id.is_none(),
             layout,
-        )
+        )?;
+        match &self.dictionary {
+            Some(dictionary) => writer.with_dictionary(dictionary.clone()),
+            None => Ok(writer),
+        }
     }
 }
 
@@ -442,6 +473,8 @@ fn finish_z_image<W: Write>(
         blob_metadata: None,
         blob_footer: footer,
         standalone_bootstrap,
+        referenced_blobs: vec![BlobId::new(full_blob_digest)],
+        dedup_stats: DedupStats::default(),
     })
 }
 
@@ -541,8 +574,23 @@ fn finish_image<W: Write>(
             Error::InvalidParameter("data digest disabled without blob id".into())
         })?,
     };
-    let device_slots = [ErofsDeviceSlot::with_blob_id(blob_blocks, &blob_id)?];
-    set_root_prefetch_blobs_xattr(&mut inodes[0], &[1])?;
+    let dedup_stats = blob_writer.dedup_stats();
+    let mut device_slots = vec![ErofsDeviceSlot::with_blob_id(blob_blocks, &blob_id)?];
+    let mut referenced_blobs = vec![BlobId::new(blob_id)];
+    for chunk in blob_writer.reused_blobs() {
+        if chunk.blob_id().as_bytes() == &blob_id {
+            return Err(Error::InvalidImage(
+                "dictionary blob ID collides with the data-region ID".into(),
+            ));
+        }
+        device_slots.push(ErofsDeviceSlot::with_blob_id(
+            u64::from(chunk.blob_blocks()),
+            chunk.blob_id().as_bytes(),
+        )?);
+        referenced_blobs.push(chunk.blob_id());
+    }
+    let prefetch: Vec<u16> = (1..=device_slots.len()).map(|id| id as u16).collect();
+    set_root_prefetch_blobs_xattr(&mut inodes[0], &prefetch)?;
     let bootstrap_bytes = render_bootstrap(&mut inodes, epoch, &device_slots, &uuid_bytes)?;
     // Nothing after rendering reads the inode tree (the standalone bootstrap
     // is patched from the rendered bytes), so free its tens of MiB before
@@ -568,13 +616,11 @@ fn finish_image<W: Write>(
     // device table (full-blob id, flattened mapped addresses), so the
     // rendered buffer is retargeted in place instead of rendering a second
     // 30+ MiB copy from the inode tree.
+    referenced_blobs[0] = BlobId::new(full_blob_digest);
     let standalone_bootstrap = if options.render_standalone_bootstrap {
         let mut standalone = bootstrap_bytes;
-        let standalone_device_slots = [ErofsDeviceSlot::with_blob_id(
-            blob_blocks,
-            &full_blob_digest,
-        )?];
-        bootstrap::flatten_bootstrap_in_place(&mut standalone, &standalone_device_slots)?;
+        device_slots[0] = ErofsDeviceSlot::with_blob_id(blob_blocks, &full_blob_digest)?;
+        bootstrap::flatten_bootstrap_in_place(&mut standalone, &device_slots)?;
         Some(standalone)
     } else {
         drop(bootstrap_bytes);
@@ -587,6 +633,8 @@ fn finish_image<W: Write>(
         blob_metadata,
         blob_footer: footer,
         standalone_bootstrap,
+        referenced_blobs,
+        dedup_stats,
     })
 }
 

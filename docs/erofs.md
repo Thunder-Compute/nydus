@@ -187,16 +187,18 @@ can span many small files.
 
 ### What is and is not deduplicated
 
-The chunk-based writer stores repeated nonzero content again. Its BLAKE3
-group digests (one per chunk group by default; `--digester none` omits them
-all) are an inspection index and the identity a content-addressed cache keys
-groups by, **not an active chunk deduplication implementation**. All-zero
-chunks use holes and consume no blob data or chunk entry. Hardlinks reuse
-inodes/data by identity.
+With `--chunk-dict`, the chunk-based writer reuses nonzero chunks from an
+organization's MDBX index and repeated chunks within the build. Chunk indexes
+point directly into the original blobs, even for individual members of a packed
+group. Without a dictionary, repeated nonzero content is stored again. BLAKE3
+group digests identify cache entries; the dictionary independently uses SHA-256
+and exact chunk lengths. See [organization chunk dictionaries](nydus.md#organization-chunk-dictionaries).
+All-zero chunks remain holes, and hardlinks reuse inodes/data by identity.
+(Authored by GPT-6.)
 
 Native z_erofs stores every small file's bytes again in the packed inode,
 even when identical to another file's; deduplication is left to the block
-volume, helped by `--erofs-data-alignment`. Nothing provides cross-image CAS
+volume, helped by `--erofs-data-alignment`. Native output provides no cross-image CAS
 or guarantees storage-provider deduplication from aligned offsets.
 
 ## 7. Directory Format

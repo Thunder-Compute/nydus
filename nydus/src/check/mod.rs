@@ -533,10 +533,12 @@ fn resolve_blobs(
 ) -> Result<HashMap<u16, ResolvedBlob>> {
     let mut resolved = HashMap::new();
 
-    if kind == ImageKind::Blob && blob_infos.len() == 1 {
+    // A full blob's own data region is always its first device slot; any
+    // further slots are chunk-dictionary dependencies, resolved via blob_dir.
+    if let (ImageKind::Blob, Some(own)) = (kind, blob_infos.first()) {
         if let Some(inspection) = inspect_blob(image_path)? {
             resolved.insert(
-                blob_infos[0].blob_index,
+                own.blob_index,
                 ResolvedBlob {
                     path: image_path.to_path_buf(),
                     blob_size: inspection.blob_size,
@@ -545,7 +547,7 @@ fn resolve_blobs(
                     data_size: inspection.data_size,
                     blob_metadata: inspection.blob_metadata,
                     slot_sha256_kind: SlotSha256Kind::Data,
-                    verified: inspection.data_sha256 == blob_infos[0].blob_id,
+                    verified: inspection.data_sha256 == own.blob_id,
                 },
             );
         }

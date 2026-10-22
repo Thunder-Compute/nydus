@@ -698,29 +698,35 @@ fn register_blobs(
 ) -> Result<HashMap<u16, u16>> {
     let mut local_to_global = HashMap::new();
     let infos = reader.blob_infos()?;
-    let info = infos.first().ok_or_else(|| {
-        Error::InvalidImage("merge source does not contain an external blob".to_string())
-    })?;
-    // The device slot stores the full-blob digest (the merge source file name),
-    // not the per-layer data digest embedded in the source bootstrap, so a
-    // registry backend can address the blob by the same digest.
-    let global_blob_index = if let Some(existing) = blob_indexes.get(&source_blob_id) {
-        *existing
-    } else {
-        let next = u16::try_from(device_slots.len())
-            .ok()
-            .and_then(|count| count.checked_add(1))
-            .ok_or_else(|| Error::Overflow("merge device count exceeds u16".to_string()))?;
-        device_slots.push(ErofsDeviceSlot::with_blob_id(info.blocks, &source_blob_id)?);
-        blob_indexes.insert(source_blob_id, next);
-        next
-    };
-    local_to_global.insert(info.blob_index, global_blob_index);
-
-    if infos.len() > 1 {
-        return Err(Error::Unsupported(
-            "merge source currently supports exactly one external blob".to_string(),
+    if infos.is_empty() {
+        return Err(Error::InvalidImage(
+            "merge source does not contain an external blob".into(),
         ));
+    }
+    for (index, info) in infos.iter().enumerate() {
+        // Device 1 is local data; subsequent devices already name full dictionary blobs. (by GPT-6)
+        let id = if index == 0 {
+            source_blob_id
+        } else {
+            info.blob_id
+        };
+        let global_blob_index = if let Some(&existing) = blob_indexes.get(&id) {
+            if device_slots[usize::from(existing) - 1].blocks() != info.blocks {
+                return Err(Error::InvalidImage(
+                    "merge sources disagree on blob size".into(),
+                ));
+            }
+            existing
+        } else {
+            let next = u16::try_from(device_slots.len())
+                .ok()
+                .and_then(|count| count.checked_add(1))
+                .ok_or_else(|| Error::Overflow("merge device count exceeds u16".into()))?;
+            device_slots.push(ErofsDeviceSlot::with_blob_id(info.blocks, &id)?);
+            blob_indexes.insert(id, next);
+            next
+        };
+        local_to_global.insert(info.blob_index, global_blob_index);
     }
     Ok(local_to_global)
 }
@@ -744,9 +750,9 @@ fn validate_single_layer_blob_source(path: &Path, reader: &ErofsReader) -> Resul
     BlobFooter::from_blob_path(path)
         .with_context(|| format!("merge source must be a full blob file: {}", path.display()))?;
     let blob_infos = reader.blob_infos()?;
-    if blob_infos.len() != 1 {
+    if blob_infos.is_empty() {
         return Err(Error::InvalidImage(
-            "merge source must contain exactly one external blob".to_string(),
+            "merge source must contain its local data device".to_string(),
         ));
     }
     Ok(())

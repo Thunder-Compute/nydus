@@ -5,9 +5,11 @@ use nydus::build::{
     save_blob_metadata_sidecar, BuildImageOptions, Image, NativeLayout,
 };
 use nydus::error::{Context, Error, Result};
+use nydus_config::GIT_COMMIT_SHORT_HASH;
 use nydus_format::blob::{BlobFooter, BlobMetadata, BlobMetadataCompressor, BlobMetadataDigester};
 use nydus_format::erofs::{ZErofsCompressor, EROFS_BLOB_ID_SIZE};
 use nydus_telemetry::logging::init_command_tracing;
+use serde::Serialize;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::BufWriter;
@@ -40,7 +42,7 @@ pub struct BuildCommand {
     #[arg(
         long,
         env = "NYDUS_BUILD_BLOB",
-        help = "Specify the file path to save the image as a single self-contained full blob; if the path is an existing FIFO the blob is streamed into it"
+        help = "Specify the full blob output path; dictionary builds also require their referenced blobs. An existing FIFO streams the output"
     )]
     blob: Option<PathBuf>,
 
@@ -50,6 +52,19 @@ pub struct BuildCommand {
         help = "Specify the content-addressed store directory to save the full blob into, named by its SHA256, so mounts resolve it through the bootstrap and images share the store"
     )]
     blob_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
+        env = "NYDUS_BUILD_CHUNK_DICT",
+        help = "Read chunks from this organization's MDBX dictionary directory; the dictionary is never updated by a build"
+    )]
+    chunk_dict: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "Write a JSON manifest in the nydus v2 `nydus-image create --output-json` schema: the tool version, every referenced blob, and the deduplication counters under trace.registered_events"
+    )]
+    output_json: Option<PathBuf>,
 
     #[arg(
         long,
@@ -93,7 +108,7 @@ pub struct BuildCommand {
         value_enum,
         default_value_t = Digester::Blake3,
         env = "NYDUS_BUILD_DIGESTER",
-        help = "Specify the digest algorithm recorded in the blob meta, one BLAKE3 digest per chunk group over its chunks back to back, for a lone chunk its content digest; \"none\" records no digests and skips hashing, for content already verified upstream"
+        help = "Specify the digest algorithm recorded in the blob meta, one BLAKE3 digest per chunk group over its chunks back to back, for a lone chunk its content digest; \"none\" records no group digests and skips group hashing, for content already verified upstream"
     )]
     digester: Digester,
 
@@ -166,6 +181,18 @@ impl Compressor {
             Self::ErofsLz4 => Some(NativeLayout::Compressed(ZErofsCompressor::Lz4)),
             Self::ErofsZstd => Some(NativeLayout::Compressed(ZErofsCompressor::Zstd)),
             Self::None | Self::Zstd | Self::Lz4 => None,
+        }
+    }
+
+    /// The manifest's compressor name: v2's `compress::Algorithm` spellings
+    /// for the chunk-based layouts, the z_erofs pcluster algorithm for the
+    /// native ones, which have no v2 counterpart.
+    fn manifest_name(self) -> &'static str {
+        match self {
+            Self::None | Self::ErofsNone => "none",
+            Self::Zstd | Self::ErofsZstd => "zstd",
+            Self::Lz4 => "lz4_block",
+            Self::ErofsLz4 => "lz4",
         }
     }
 }
@@ -248,6 +275,11 @@ impl BuildCommand {
                 .map(|(dir, id)| dir.join(hex::encode(id)))
         });
         self.validate_output_paths(full_blob_path.as_deref())?;
+        if self.chunk_dict.is_some()
+            && (self.compressor.native().is_some() || self.blob_id.is_some())
+        {
+            return Err(Error::InvalidParameter("--chunk-dict requires none, zstd or lz4 compression and cannot be combined with --blob-id".into()));
+        }
         if self.erofs_data_alignment.as_u64() != 0 && self.compressor.native().is_none() {
             return Err(Error::InvalidParameter(
                 "--erofs-data-alignment requires an erofs-* compressor".to_string(),
@@ -279,8 +311,13 @@ impl BuildCommand {
 
     fn validate_output_paths(&self, full_blob_path: Option<&Path>) -> Result<()> {
         let sidecar = full_blob_path.map(Self::blob_metadata_path);
+        let dict_data = self.chunk_dict.as_ref().map(|path| path.join("mdbx.dat"));
+        let dict_lock = self.chunk_dict.as_ref().map(|path| path.join("mdbx.lck"));
         let mut paths = Vec::new();
         for (name, path) in [
+            ("output JSON", self.output_json.as_deref()),
+            ("dictionary data", dict_data.as_deref()),
+            ("dictionary lock", dict_lock.as_deref()),
             ("--blob", full_blob_path),
             ("blob metadata sidecar", sidecar.as_deref()),
             ("--bootstrap", self.bootstrap.as_deref()),
@@ -415,7 +452,12 @@ impl BuildCommand {
             }
             None => options,
         };
-        Ok(options)
+        match &self.chunk_dict {
+            Some(path) => options.with_dictionary(std::sync::Arc::new(
+                nydus::build::dictionary::Dictionary::open_read_only(path)?,
+            )),
+            None => Ok(options),
+        }
     }
 
     /// Runs the build: writes the full blob, settles it under its final name,
@@ -446,6 +488,16 @@ impl BuildCommand {
             blob_output.finalize(&image.full_blob_digest, options.blob_id().is_some())?;
         let blob_metadata_path = Self::save_blob_metadata(&image, &full_blob_path)?;
         self.save_bootstrap(&image)?;
+        if let Some(path) = &self.output_json {
+            let manifest = BuildManifest::new(self, &image);
+            fs::write(path, serde_json::to_vec_pretty(&manifest)?)?;
+        }
+        tracing::info!(
+            reused_chunks = image.dedup_stats.reused_chunks,
+            reused_bytes = image.dedup_stats.reused_bytes,
+            referenced_blobs = image.referenced_blobs.len(),
+            "chunk deduplication"
+        );
 
         print_blob_build_summary(BlobBuildSummary {
             index: 0,
@@ -494,6 +546,86 @@ impl BuildCommand {
         }
 
         Ok(())
+    }
+}
+
+/// The `--output-json` manifest: the nydus v2 `nydus-image create
+/// --output-json` schema, so consumers of that file parse v3 builds
+/// unchanged.
+#[derive(Serialize)]
+struct BuildManifest {
+    /// The builder version, `<package version>-<git commit>`.
+    version: String,
+    /// The standalone bootstrap path, empty without `--bootstrap`.
+    bootstrap: String,
+    /// Every blob the image references, this build's output first.
+    blobs: Vec<String>,
+    /// v3 has no external blobs; both stay empty, as v2 emits them for local
+    /// builds.
+    external_bootstrap: String,
+    external_blobs: Vec<String>,
+    trace: BuildManifestTrace,
+    /// The filesystem format generation: "7", the pure-EROFS layout v3
+    /// builds (v2 reports "5" or "6" for its RAFS versions, which v3 cannot
+    /// read).
+    fs_version: String,
+    /// The data compression algorithm (see [`Compressor::manifest_name`]).
+    compressor: String,
+}
+
+/// The manifest's trace section. v2 also records wall-clock timings under
+/// `consumed_time`, which v3 does not track.
+#[derive(Serialize)]
+struct BuildManifestTrace {
+    /// Counters keyed as in v2 and, as there, present only once recorded:
+    /// `blob_uncompressed_size` is the uncompressed size of the data this
+    /// build wrote (absent when nothing was written, and for native layers,
+    /// which carry no blob meta to sum it from); `dedup_chunks` and
+    /// `dedup_uncompressed_size` count the chunks and uncompressed bytes
+    /// reused from the chunk dictionary.
+    registered_events: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Implement the v2 schema mapping for BuildManifest.
+impl BuildManifest {
+    fn new(command: &BuildCommand, image: &Image) -> Self {
+        let mut registered_events = serde_json::Map::new();
+        let new_data = image
+            .blob_metadata
+            .as_ref()
+            .map(BlobMetadata::uncompressed_size)
+            .unwrap_or(0);
+        if new_data > 0 {
+            registered_events.insert("blob_uncompressed_size".to_string(), new_data.into());
+        }
+        if image.dedup_stats.reused_chunks > 0 {
+            registered_events.insert(
+                "dedup_chunks".to_string(),
+                image.dedup_stats.reused_chunks.into(),
+            );
+            registered_events.insert(
+                "dedup_uncompressed_size".to_string(),
+                image.dedup_stats.reused_bytes.into(),
+            );
+        }
+        Self {
+            version: format!("{}-{}", env!("CARGO_PKG_VERSION"), GIT_COMMIT_SHORT_HASH),
+            bootstrap: command
+                .bootstrap
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            blobs: image
+                .referenced_blobs
+                .iter()
+                .map(|id| id.to_hex())
+                .collect(),
+            external_bootstrap: String::new(),
+            external_blobs: Vec::new(),
+            trace: BuildManifestTrace { registered_events },
+            fs_version: "7".to_string(),
+            compressor: command.compressor.manifest_name().to_string(),
+        }
     }
 }
 
@@ -1152,6 +1284,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The JSON field set thundernetes parses from v2 `nydus-image create
+    /// --output-json` (services/internal/sandbox/imagejob_nydus/nydus/
+    /// converter.go); the v3 manifest must deserialize into it unchanged.
+    #[derive(serde::Deserialize)]
+    struct ThundernetesManifest {
+        blobs: Vec<String>,
+        version: String,
+        trace: ThundernetesTrace,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ThundernetesTrace {
+        registered_events: ThundernetesEvents,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ThundernetesEvents {
+        dedup_chunks: Option<i64>,
+        dedup_uncompressed_size: Option<i64>,
+        blob_uncompressed_size: Option<i64>,
+    }
+
+    #[test]
+    fn output_json_emits_the_v2_create_schema() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("data"), vec![42; 9000]).unwrap();
+        let blob = dir.path().join("out.blob");
+        let bootstrap = dir.path().join("image.boot");
+        let output = dir.path().join("manifest.json");
+        let mut cmd = tar_command(&source, &blob);
+        cmd.source_type = SourceType::Dir;
+        cmd.chunk_size = Some(ByteSize::kib(4));
+        cmd.bootstrap = Some(bootstrap.clone());
+        cmd.output_json = Some(output.clone());
+
+        cmd.run(&cmd.prepare().unwrap()).unwrap();
+
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+        let mut keys: Vec<&str> = raw
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "blobs",
+                "bootstrap",
+                "compressor",
+                "external_blobs",
+                "external_bootstrap",
+                "fs_version",
+                "trace",
+                "version",
+            ]
+        );
+        assert_eq!(raw["bootstrap"], bootstrap.display().to_string());
+        assert_eq!(raw["external_bootstrap"], "");
+        assert_eq!(raw["external_blobs"], serde_json::json!([]));
+        assert_eq!(raw["fs_version"], "7");
+        assert_eq!(raw["compressor"], "zstd");
+        assert_eq!(raw["trace"].as_object().unwrap().len(), 1);
+
+        let parsed: ThundernetesManifest =
+            serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+        assert!(!parsed.version.is_empty());
+        assert_eq!(parsed.blobs.len(), 1);
+        assert_eq!(parsed.blobs[0].len(), 64);
+        assert!(parsed.blobs[0].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let events = parsed.trace.registered_events;
+        assert_eq!(events.blob_uncompressed_size, Some(9000));
+        assert_eq!(events.dedup_chunks, None);
+        assert_eq!(events.dedup_uncompressed_size, None);
     }
 
     #[test]

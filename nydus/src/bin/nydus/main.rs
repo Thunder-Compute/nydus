@@ -5,6 +5,7 @@ use nydus_config::{default_log_dir, VersionValueParser, NAME};
 pub mod api_server;
 pub mod build;
 pub mod check;
+pub mod dictionary;
 pub mod export;
 #[cfg(feature = "fanotify")]
 pub mod fanotify;
@@ -58,6 +59,9 @@ pub enum Command {
         long_about = "Build a chunk-based nydus filesystem image from a directory, producing a full blob and an optional standalone bootstrap."
     )]
     Build(build::BuildCommand),
+
+    #[command(about = "Manage an organization's MDBX chunk dictionary")]
+    Dictionary(dictionary::DictionaryCommand),
 
     #[command(
         name = "export",
@@ -161,13 +165,19 @@ impl Command {
     fn is_daemon(&self) -> bool {
         !matches!(
             self,
-            Self::Build(_) | Self::Export(_) | Self::Check(_) | Self::Merge(_) | Self::Optimize(_)
+            Self::Dictionary(_)
+                | Self::Build(_)
+                | Self::Export(_)
+                | Self::Check(_)
+                | Self::Merge(_)
+                | Self::Optimize(_)
         )
     }
 
     pub fn execute(self) -> Result<()> {
         match self {
             Self::Build(cmd) => cmd.execute(),
+            Self::Dictionary(cmd) => cmd.execute(),
             Self::Export(cmd) => cmd.execute(),
             Self::Check(cmd) => cmd.execute(),
             Self::Merge(cmd) => cmd.execute(),
