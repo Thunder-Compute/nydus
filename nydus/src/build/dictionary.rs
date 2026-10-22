@@ -1,6 +1,7 @@
 //! Persistent, append-only chunk dictionaries, one MDBX environment per organization.
 //! Import blobs only after publishing them; builds never modify the dictionary. (by GPT-6)
 
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -44,8 +45,22 @@ fn mdbx(err: libmdbx::Error) -> Error {
 }
 
 impl Dictionary {
-    pub fn open(path: &Path) -> Result<Self> {
+    /// Opens a dictionary for writing, creating its directory if needed.
+    pub fn create(path: &Path) -> Result<Self> {
         fs::create_dir_all(path)?;
+        Self::open_mode(path, false)
+    }
+
+    /// Opens a dictionary for writing. The directory must already exist, so a
+    /// mistyped path fails instead of becoming a new dictionary; an empty
+    /// directory is initialized. (by Claude Opus 5.5)
+    pub fn open(path: &Path) -> Result<Self> {
+        if !path.is_dir() {
+            return Err(Error::InvalidParameter(format!(
+                "chunk dictionary directory does not exist: {}",
+                path.display()
+            )));
+        }
         Self::open_mode(path, false)
     }
 
@@ -116,6 +131,15 @@ impl Dictionary {
     pub fn add_blob(&self, path: &Path) -> Result<BlobId> {
         let mut file = File::open(path)?;
         let id = BlobId::new(sha256_reader(&mut file)?);
+        // Readers resolve dependencies only as `<blob dir>/<hex digest>`, so a
+        // blob indexed under any other name would make later images unreadable.
+        if path.file_name() != Some(OsStr::new(&id.to_hex())) {
+            return Err(Error::InvalidParameter(format!(
+                "dictionary blob {} must be named by its SHA-256 digest {}",
+                path.display(),
+                id.to_hex()
+            )));
+        }
         let size = file.metadata()?.len();
         let footer = BlobFooter::from_blob_path(path)?;
         if footer.is_raw_device() {

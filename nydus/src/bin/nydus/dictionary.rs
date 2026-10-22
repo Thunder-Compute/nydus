@@ -14,7 +14,7 @@ pub struct DictionaryCommand {
 enum Operation {
     /// Create an empty dictionary directory for one organization.
     Init { path: PathBuf },
-    /// Atomically add each already-published full blob to the dictionary.
+    /// Atomically add each already-published full blob to an existing dictionary directory.
     Add {
         #[arg(long)]
         dictionary: PathBuf,
@@ -35,7 +35,7 @@ impl DictionaryCommand {
     pub fn execute(&self) -> Result<()> {
         match &self.command {
             Operation::Init { path } => {
-                Dictionary::open(path)?;
+                Dictionary::create(path)?;
             }
             Operation::Add { dictionary, blobs } => {
                 let dictionary = Dictionary::open(dictionary)?;

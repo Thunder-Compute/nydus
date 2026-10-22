@@ -8,10 +8,12 @@ use std::sync::Arc;
 use nydus::build::dictionary::Dictionary;
 use nydus::build::merge::{merge_sources_to_bootstrap_bytes, WhiteoutSpec};
 use nydus::build::{build_image, build_image_from_tar_layer, BuildImageOptions, Image};
+use nydus::check::{check_image, ImageKind};
 use nydus_backend::Local;
 use nydus_core::build::dictionary::{ChunkDictionary, ChunkKey};
 use nydus_core::ErofsReader;
 use nydus_format::blob::BlobMetadataCompressor;
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 fn options(source: &Path, compressor: BlobMetadataCompressor) -> BuildImageOptions {
@@ -81,7 +83,7 @@ fn dictionary_reuses_individual_packed_chunks_across_images_and_layers() {
             let (seed, seed_path) = build(&store, &options(&source, compressor), None);
             assert_eq!(seed.blob_metadata.as_ref().unwrap().chunk_group_count(), 1);
             let dict_path = dir.path().join("org-a");
-            let dictionary = Dictionary::open(&dict_path).unwrap();
+            let dictionary = Dictionary::create(&dict_path).unwrap();
             dictionary.add_blob(&seed_path).unwrap();
             dictionary.add_blob(&seed_path).unwrap();
             assert_eq!(dictionary.blobs().unwrap().len(), 1);
@@ -219,7 +221,7 @@ fn dictionary_isolation_merge_and_concurrent_additions() {
         &options(&source, BlobMetadataCompressor::Zstd),
         None,
     );
-    let dictionary = Arc::new(Dictionary::open(&dir.path().join("org-a")).unwrap());
+    let dictionary = Arc::new(Dictionary::create(&dir.path().join("org-a")).unwrap());
     std::thread::scope(|scope| {
         for path in [&first_path, &second_path] {
             let dictionary = dictionary.clone();
@@ -229,7 +231,7 @@ fn dictionary_isolation_merge_and_concurrent_additions() {
         }
     });
     assert_eq!(dictionary.blobs().unwrap().len(), 2);
-    let other = Arc::new(Dictionary::open(&dir.path().join("org-b")).unwrap());
+    let other = Arc::new(Dictionary::create(&dir.path().join("org-b")).unwrap());
     assert!(other
         .lookup(&ChunkKey::from_data(&first[..4096]).unwrap())
         .unwrap()
@@ -244,7 +246,7 @@ fn dictionary_isolation_merge_and_concurrent_additions() {
     assert_eq!(isolated.dedup_stats.reused_chunks, 0);
     assert_eq!(isolated.referenced_blobs.len(), 1);
     let snapshot_path = dir.path().join("org-a-snapshot");
-    let snapshot = Dictionary::open(&snapshot_path).unwrap();
+    let snapshot = Dictionary::create(&snapshot_path).unwrap();
     snapshot.merge(&dictionary).unwrap();
     snapshot.merge(&dictionary).unwrap();
     drop(snapshot);
@@ -274,9 +276,14 @@ fn dictionary_failed_import_is_atomic() {
     let metadata = image.blob_metadata.unwrap();
     let mut bytes = fs::read(&path).unwrap();
     bytes[metadata.chunk_group(1).unwrap().compressed_offset() as usize] ^= 0xff;
+    // Name the corrupt blob by its new digest so the import gets past the
+    // file-name check and fails on the chunk-group CRC instead.
+    fs::remove_file(&path).unwrap();
+    let path = dir.path().join(hex::encode(Sha256::digest(&bytes)));
     fs::write(&path, bytes).unwrap();
-    let dictionary = Dictionary::open(&dir.path().join("org")).unwrap();
-    assert!(dictionary.add_blob(&path).is_err());
+    let dictionary = Dictionary::create(&dir.path().join("org")).unwrap();
+    let err = dictionary.add_blob(&path).unwrap_err().to_string();
+    assert!(!err.contains("must be named"), "{err}");
     assert!(dictionary.blobs().unwrap().is_empty());
     assert!(dictionary
         .lookup(&ChunkKey::from_data(&vec![3; 4096]).unwrap())
@@ -289,7 +296,7 @@ fn dictionary_registers_only_used_blobs_and_spans_device_table_blocks() {
     let dir = tempdir().unwrap();
     let source = dir.path().join("source");
     fs::create_dir(&source).unwrap();
-    let dictionary = Arc::new(Dictionary::open(&dir.path().join("org")).unwrap());
+    let dictionary = Arc::new(Dictionary::create(&dir.path().join("org")).unwrap());
     for byte in 1..=26u8 {
         fs::write(source.join("file"), vec![byte; 100]).unwrap();
         let (_, path) = build(
@@ -416,5 +423,82 @@ fn dictionary_cli_build_manifest_and_snapshot() {
             .success());
     }
     assert!(!dir.path().join("bad").exists());
+    let blob_arg = format!("blobs/{id}");
+    assert!(!Command::new(env!("CARGO_BIN_EXE_nydus"))
+        .current_dir(dir.path())
+        .args(["dictionary", "add", "--dictionary", "absent", &blob_arg])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(!dir.path().join("absent").exists());
     run(&["dictionary", "info", "org"]);
+}
+
+#[test]
+fn dictionary_add_requires_existing_directory_and_digest_named_blob() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("file"), vec![9; 5000]).unwrap();
+    let (_, path) = build(
+        dir.path(),
+        &options(&source, BlobMetadataCompressor::None),
+        None,
+    );
+
+    let missing = dir.path().join("org-typo");
+    assert!(Dictionary::open(&missing).is_err());
+    assert!(!missing.exists(), "open must not create the directory");
+
+    let empty = dir.path().join("contribution");
+    fs::create_dir(&empty).unwrap();
+    let dictionary = Dictionary::open(&empty).unwrap();
+    let renamed = dir.path().join("layer.blob");
+    fs::copy(&path, &renamed).unwrap();
+    let err = dictionary.add_blob(&renamed).unwrap_err().to_string();
+    assert!(err.contains("must be named"), "{err}");
+    assert!(dictionary.blobs().unwrap().is_empty());
+    dictionary.add_blob(&path).unwrap();
+    assert_eq!(dictionary.blobs().unwrap().len(), 1);
+}
+
+#[test]
+fn check_verifies_dictionary_built_blob_data_region() {
+    let dir = tempdir().unwrap();
+    let store = dir.path().join("blobs");
+    let source = dir.path().join("source");
+    fs::create_dir(&store).unwrap();
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("shared"), vec![21; 8192]).unwrap();
+    let (_, seed_path) = build(
+        &store,
+        &options(&source, BlobMetadataCompressor::None),
+        None,
+    );
+    let dictionary = Arc::new(Dictionary::create(&dir.path().join("org")).unwrap());
+    dictionary.add_blob(&seed_path).unwrap();
+    fs::write(source.join("new"), vec![22; 8192]).unwrap();
+    let (image, path) = build(
+        &store,
+        &options(&source, BlobMetadataCompressor::None)
+            .with_dictionary(dictionary)
+            .unwrap(),
+        None,
+    );
+    assert_eq!(image.referenced_blobs.len(), 2);
+
+    let report = check_image(ImageKind::Blob, &path, None).unwrap();
+    assert_eq!(report.blobs.len(), 2);
+    let mut blobs = report.blobs.values();
+    let own = blobs.next().unwrap();
+    assert!(own.verified, "the blob's own data region must verify");
+    assert_eq!(own.resolved_path.as_deref(), Some(path.as_path()));
+    assert!(
+        !blobs.next().unwrap().verified,
+        "dependency needs --blob-dir"
+    );
+
+    let report = check_image(ImageKind::Blob, &path, Some(&store)).unwrap();
+    assert!(report.blobs.values().all(|blob| blob.verified));
 }

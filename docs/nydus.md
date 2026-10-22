@@ -101,8 +101,8 @@ For distributed image jobs, keep publication separate from conversion:
 
 1. Build against a local snapshot of the organization's dictionary.
 2. Publish the new blob and bootstrap, retaining every referenced source blob.
-3. Add the published blob to a contribution dictionary (an empty directory is
-   initialized by `dictionary add`).
+3. Add the published blob to a contribution dictionary (an existing empty
+   directory is initialized by `dictionary add`; a missing one is an error).
 4. Refresh the organization dictionary and merge the contribution with
    `nydus dictionary merge --dictionary /catalogs/org-a /job/contribution`.
    Serialize or use compare-and-swap for remote checkpoint publication to avoid
@@ -119,7 +119,8 @@ required by existing images even after retiring a dictionary. Garbage collection
 and remote catalog transport remain the caller's responsibility. Build manifests
 contain only used dictionary blobs; `dictionary info` lists all imported blobs,
 including ones whose chunks already existed. Missing dictionary paths are errors,
-not silent cache misses. Missing payload blobs fail at read time.
+not silent cache misses. `dictionary add` only accepts blobs whose file name is
+their full-blob SHA-256, since that is the only name readers look up. Missing payload blobs fail at read time.
 
 The embedded bootstrap reserves device 1 for new data and names dependencies by
 their full-blob digests. Merge retags only device 1, preserves dependency IDs, and
