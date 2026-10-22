@@ -9,6 +9,7 @@
 
 pub mod blob_chunk;
 pub mod bootstrap;
+pub mod dictionary;
 pub(crate) mod dir;
 pub(crate) mod image;
 pub mod inode;

@@ -101,10 +101,9 @@ impl ErofsReader {
         })
     }
 
-    /// Open a self-contained full blob (`payload + bootstrap + blob meta +
-    /// footer`): everything is served from the file itself, no remote
-    /// backend is involved. `cache_dir`, when given, caches the decoded
-    /// chunk groups so repeat reads skip re-decoding from the blob.
+    /// Open a full blob and resolve its local data from that file. Dictionary
+    /// dependencies must be present beside it under their full-blob digests.
+    /// `cache_dir` caches decoded groups for repeat reads. (by GPT-6)
     pub fn open_blob(blob_path: &Path, cache_dir: Option<&Path>) -> io::Result<Self> {
         Self::open_blob_with_metrics(
             blob_path,
@@ -138,8 +137,8 @@ impl ErofsReader {
 
         let blob_infos = Self::blob_infos_from(&mmap, sb_offset)?;
         let blob_dir = blob_path.parent().unwrap_or_else(|| Path::new("."));
-        let backend: Arc<dyn BlobBackend> = match blob_infos.as_slice() {
-            [info] => Arc::new(Local::with_full_blob_source(
+        let backend: Arc<dyn BlobBackend> = match blob_infos.first() {
+            Some(info) => Arc::new(Local::with_full_blob_source(
                 blob_dir.to_path_buf(),
                 info.blob_id,
                 blob_path,

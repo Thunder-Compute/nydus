@@ -1,3 +1,5 @@
+use super::dictionary::{ChunkDictionary, ChunkKey, DedupStats, DictionaryChunk};
+use crate::BlobId;
 use crc32c::crc32c;
 use nydus_error::{Context, Error, Result};
 use nydus_format::blob::{
@@ -10,7 +12,7 @@ use nydus_format::erofs::{
 };
 use nydus_storage::io::write_zeros;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::mem;
@@ -68,6 +70,11 @@ pub(crate) fn validate_chunk_group_min_size(chunk_group_min_size: u32) -> Result
 /// device mode places chunks immediately and needs no resolution.
 pub struct BlobWriter<W> {
     writer: W,
+    dictionary: Option<Arc<dyn ChunkDictionary>>,
+    seen_chunks: HashMap<ChunkKey, ErofsChunkAddr>,
+    reused_blobs: Vec<DictionaryChunk>,
+    reused_blob_indexes: HashMap<BlobId, u16>,
+    dedup_stats: DedupStats,
     file_chunk_size: u32,
     compressor: BlobMetadataCompressor,
     digester: Option<BlobMetadataDigester>,
@@ -986,6 +993,11 @@ impl<W: Write> BlobWriter<W> {
         };
         let mut writer = Self {
             writer,
+            dictionary: None,
+            seen_chunks: HashMap::new(),
+            reused_blobs: Vec::new(),
+            reused_blob_indexes: HashMap::new(),
+            dedup_stats: DedupStats::default(),
             file_chunk_size: chunk_size,
             compressor,
             digester,
@@ -1069,6 +1081,77 @@ impl<W: Write> BlobWriter<W> {
             }
         }
         Ok(writer)
+    }
+
+    pub fn with_dictionary(mut self, dictionary: Arc<dyn ChunkDictionary>) -> Result<Self> {
+        if self.dictionary.is_some() || !self.placements.is_empty() {
+            return Err(Error::InvalidParameter(
+                "configure the chunk dictionary once, before writing data".into(),
+            ));
+        }
+        if self.raw_device || self.z_erofs_enabled() {
+            return Err(Error::Unsupported(
+                "chunk dictionaries require chunk-group output".into(),
+            ));
+        }
+        self.dictionary = Some(dictionary);
+        Ok(self)
+    }
+
+    pub fn reused_blobs(&self) -> &[DictionaryChunk] {
+        &self.reused_blobs
+    }
+
+    pub fn dedup_stats(&self) -> DedupStats {
+        self.dedup_stats
+    }
+
+    fn write_or_reuse_chunk(&mut self, data: &[u8]) -> Result<ErofsChunkAddr> {
+        let Some(dictionary) = &self.dictionary else {
+            return Ok(ErofsChunkAddr {
+                blkaddr: self.append_chunk(data)?,
+                device_id: 1,
+            });
+        };
+        let key = ChunkKey::from_data(data)?;
+        let reused = if let Some(addr) = self.seen_chunks.get(&key) {
+            Some(*addr)
+        } else if let Some(chunk) = dictionary.lookup(&key)? {
+            let device_id = if let Some(&id) = self.reused_blob_indexes.get(&chunk.blob_id()) {
+                if self.reused_blobs[usize::from(id) - 2].blob_blocks() != chunk.blob_blocks() {
+                    return Err(Error::InvalidImage(
+                        "inconsistent dictionary blob size".into(),
+                    ));
+                }
+                id
+            } else {
+                let id = u16::try_from(self.reused_blobs.len() + 2).map_err(|_| {
+                    Error::Overflow("dictionary references exceed device limit".into())
+                })?;
+                self.reused_blobs.push(chunk);
+                self.reused_blob_indexes.insert(chunk.blob_id(), id);
+                id
+            };
+            Some(ErofsChunkAddr {
+                blkaddr: u64::from(chunk.block_address()),
+                device_id,
+            })
+        } else {
+            None
+        };
+        let addr = match reused {
+            Some(addr) => {
+                self.dedup_stats.reused_chunks += 1;
+                self.dedup_stats.reused_bytes += data.len() as u64;
+                addr
+            }
+            None => ErofsChunkAddr {
+                blkaddr: self.append_chunk(data)?,
+                device_id: 1,
+            },
+        };
+        self.seen_chunks.insert(key, addr);
+        Ok(addr)
     }
 
     /// Whether the writer is in raw device mode (see [`BlobLayout::RawDevice`]).
@@ -1687,18 +1770,15 @@ impl<W: Write> BlobWriter<W> {
                 continue;
             }
 
-            let blkaddr = match self.append_chunk(&chunk_buf[..to_read]) {
-                Ok(blkaddr) => blkaddr,
+            let addr = match self.write_or_reuse_chunk(&chunk_buf[..to_read]) {
+                Ok(addr) => addr,
                 Err(err) => {
                     self.chunk_buf = chunk_buf;
                     return Err(err);
                 }
             };
 
-            indexes.push(ErofsChunkAddr {
-                blkaddr,
-                device_id: 1,
-            });
+            indexes.push(addr);
         }
         self.chunk_buf = chunk_buf;
 

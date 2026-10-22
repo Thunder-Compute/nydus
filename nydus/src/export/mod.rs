@@ -2,9 +2,9 @@
 //!
 //! A nydus layer blob is self-describing — `[data | bootstrap | blob meta |
 //! footer]` — so a single blob file carries both the filesystem tree and the
-//! chunk data of exactly one OCI layer. Walking that tree and emitting a tar
-//! entry per inode reproduces the layer without consulting a merged bootstrap
-//! or any lower layer.
+//! new chunk data of one OCI layer. Dictionary-backed layers additionally
+//! require their referenced blobs. Walking the tree reproduces the layer
+//! without consulting a merged bootstrap. (by GPT-6)
 //!
 //! OCI whiteouts need no special handling: the conversion extracts `.wh.*`
 //! markers verbatim into the source tree, so they are ordinary inodes here and

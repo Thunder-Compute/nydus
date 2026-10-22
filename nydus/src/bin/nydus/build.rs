@@ -40,7 +40,7 @@ pub struct BuildCommand {
     #[arg(
         long,
         env = "NYDUS_BUILD_BLOB",
-        help = "Specify the file path to save the image as a single self-contained full blob; if the path is an existing FIFO the blob is streamed into it"
+        help = "Specify the full blob output path; dictionary builds also require their referenced blobs. An existing FIFO streams the output"
     )]
     blob: Option<PathBuf>,
 
@@ -50,6 +50,19 @@ pub struct BuildCommand {
         help = "Specify the content-addressed store directory to save the full blob into, named by its SHA256, so mounts resolve it through the bootstrap and images share the store"
     )]
     blob_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
+        env = "NYDUS_BUILD_CHUNK_DICT",
+        help = "Read chunks from this organization's MDBX dictionary directory; the dictionary is never updated by a build"
+    )]
+    chunk_dict: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "Write a JSON manifest of all referenced blobs and deduplication counters"
+    )]
+    output_json: Option<PathBuf>,
 
     #[arg(
         long,
@@ -93,7 +106,7 @@ pub struct BuildCommand {
         value_enum,
         default_value_t = Digester::Blake3,
         env = "NYDUS_BUILD_DIGESTER",
-        help = "Specify the digest algorithm recorded in the blob meta, one BLAKE3 digest per chunk group over its chunks back to back, for a lone chunk its content digest; \"none\" records no digests and skips hashing, for content already verified upstream"
+        help = "Specify the digest algorithm recorded in the blob meta, one BLAKE3 digest per chunk group over its chunks back to back, for a lone chunk its content digest; \"none\" records no group digests and skips group hashing, for content already verified upstream"
     )]
     digester: Digester,
 
@@ -248,6 +261,11 @@ impl BuildCommand {
                 .map(|(dir, id)| dir.join(hex::encode(id)))
         });
         self.validate_output_paths(full_blob_path.as_deref())?;
+        if self.chunk_dict.is_some()
+            && (self.compressor.native().is_some() || self.blob_id.is_some())
+        {
+            return Err(Error::InvalidParameter("--chunk-dict requires none, zstd or lz4 compression and cannot be combined with --blob-id".into()));
+        }
         if self.erofs_data_alignment.as_u64() != 0 && self.compressor.native().is_none() {
             return Err(Error::InvalidParameter(
                 "--erofs-data-alignment requires an erofs-* compressor".to_string(),
@@ -279,8 +297,13 @@ impl BuildCommand {
 
     fn validate_output_paths(&self, full_blob_path: Option<&Path>) -> Result<()> {
         let sidecar = full_blob_path.map(Self::blob_metadata_path);
+        let dict_data = self.chunk_dict.as_ref().map(|path| path.join("mdbx.dat"));
+        let dict_lock = self.chunk_dict.as_ref().map(|path| path.join("mdbx.lck"));
         let mut paths = Vec::new();
         for (name, path) in [
+            ("output JSON", self.output_json.as_deref()),
+            ("dictionary data", dict_data.as_deref()),
+            ("dictionary lock", dict_lock.as_deref()),
             ("--blob", full_blob_path),
             ("blob metadata sidecar", sidecar.as_deref()),
             ("--bootstrap", self.bootstrap.as_deref()),
@@ -415,7 +438,12 @@ impl BuildCommand {
             }
             None => options,
         };
-        Ok(options)
+        match &self.chunk_dict {
+            Some(path) => options.with_dictionary(std::sync::Arc::new(
+                nydus::build::dictionary::Dictionary::open_read_only(path)?,
+            )),
+            None => Ok(options),
+        }
     }
 
     /// Runs the build: writes the full blob, settles it under its final name,
@@ -446,6 +474,23 @@ impl BuildCommand {
             blob_output.finalize(&image.full_blob_digest, options.blob_id().is_some())?;
         let blob_metadata_path = Self::save_blob_metadata(&image, &full_blob_path)?;
         self.save_bootstrap(&image)?;
+        if let Some(path) = &self.output_json {
+            let manifest = serde_json::json!({
+                "version": 1,
+                "blobs": image.referenced_blobs.iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
+                "new_blob": hex::encode(image.full_blob_digest),
+                "new_data_bytes": image.blob_footer.compressed_data_size(),
+                "deduplicated_chunks": image.dedup_stats.reused_chunks,
+                "deduplicated_bytes": image.dedup_stats.reused_bytes,
+            });
+            fs::write(path, serde_json::to_vec_pretty(&manifest)?)?;
+        }
+        tracing::info!(
+            reused_chunks = image.dedup_stats.reused_chunks,
+            reused_bytes = image.dedup_stats.reused_bytes,
+            referenced_blobs = image.referenced_blobs.len(),
+            "chunk deduplication"
+        );
 
         print_blob_build_summary(BlobBuildSummary {
             index: 0,

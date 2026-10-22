@@ -14,6 +14,7 @@ runtime read path.
 The user-facing commands are:
 
 - `nydus build`
+- `nydus dictionary`
 - `nydus export`
 - `nydus check`
 - `nydus merge`
@@ -45,10 +46,95 @@ encoded ranges in the stored data region.
 ## Non-goals
 
 - Preserve on-disk compatibility with earlier Nydus image formats (RAFS v5/v6).
-- Introduce chunk-content or cross-layer global deduplication.
 - Lazily load native `erofs-*` layers through the nydus daemons: they are
 	block-device artifacts the kernel mounts directly.
 - Rework the full EROFS on-disk layout to match every upstream variant.
+
+## Organization chunk dictionaries
+
+`nydus build --chunk-dict /catalogs/org-a` reuses individual chunks from an
+MDBX dictionary. Use a separate directory per organization; selecting the path
+is the caller's isolation boundary. No dictionary or database is needed at
+runtime: image chunk indexes refer directly to the original blobs. Both
+`--source-type dir` and `--source-type tar` support dictionaries with `none`,
+`zstd`, and `lz4` compression. Native `erofs-*` output and `--blob-id` are
+rejected with `--chunk-dict`.
+
+```sh
+nydus dictionary init /catalogs/org-a
+nydus build rootfs-a --blob-dir blobs --bootstrap a.boot \
+  --chunk-dict /catalogs/org-a --output-json a.json
+# Publish a.boot and every blob named in a.json before adding the new blob.
+nydus dictionary add --dictionary /catalogs/org-a blobs/NEW_BLOB_SHA256
+nydus build rootfs-b --blob-dir blobs --bootstrap b.boot \
+  --chunk-dict /catalogs/org-a --output-json b.json
+nydus dictionary info /catalogs/org-a
+```
+
+The JSON build manifest lists **all** required blobs in `blobs`, identifies the
+new output in `new_blob`, and reports `new_data_bytes` (compressed),
+`deduplicated_bytes` (uncompressed), and `deduplicated_chunks`. Repeated chunks
+within a dictionary-enabled build also reuse their first placement. Zero chunks
+remain holes, and hardlinks share their inode. A completely reused image still
+emits a metadata-bearing full blob with an empty data region.
+
+`dictionary add` hashes the full blob to obtain its content address, decodes and
+CRC-checks each physical chunk group, and indexes its individual members. It
+does not require the source rootfs, a synthetic dictionary tar, a dictionary
+bootstrap, or any previously referenced blobs. The key is SHA-256 of the exact
+uncompressed chunk bytes plus their length; values identify a blob and logical
+block address. This works across compression settings and group boundaries,
+including reuse of one member of a larger compressed group. Reading that member
+still fetches and decompresses its original group. Chunking remains fixed-size:
+use consistent chunk sizes to maximize matches; byte insertions can shift later
+boundaries. Dictionary hashing remains enabled with `--digester none`.
+
+Each blob import commits atomically. Existing locations win when content is
+already indexed; repeat imports are idempotent. MDBX serializes writers and
+allows concurrent readers. A build performs short read transactions and can
+observe newly committed additions; existing locations never change. Keep one
+`Dictionary` handle per environment per process and share it with `Arc` when
+using the Rust API. The environment grows on demand up to 1 TiB. Unknown schema
+versions and malformed references fail explicitly.
+
+For distributed image jobs, keep publication separate from conversion:
+
+1. Build against a local snapshot of the organization's dictionary.
+2. Publish the new blob and bootstrap, retaining every referenced source blob.
+3. Add the published blob to a contribution dictionary (an empty directory is
+   initialized by `dictionary add`).
+4. Refresh the organization dictionary and merge the contribution with
+   `nydus dictionary merge --dictionary /catalogs/org-a /job/contribution`.
+   Serialize or use compare-and-swap for remote checkpoint publication to avoid
+   losing another job's update; MDBX locks coordinate only processes sharing
+   the same local environment.
+5. Produce a consistent snapshot with
+   `nydus dictionary merge --dictionary /snapshots/org-a /catalogs/org-a`, using
+   a fresh destination. After the command exits, publish its `mdbx.dat`; restore
+   it into a directory on the next job. MDBX creates a local `mdbx.lck` as needed.
+   Do not copy a live data file directly or distribute the lock file.
+
+Retain indexed blobs while the dictionary can reference them, and retain blobs
+required by existing images even after retiring a dictionary. Garbage collection
+and remote catalog transport remain the caller's responsibility. Build manifests
+contain only used dictionary blobs; `dictionary info` lists all imported blobs,
+including ones whose chunks already existed. Missing dictionary paths are errors,
+not silent cache misses. Missing payload blobs fail at read time.
+
+The embedded bootstrap reserves device 1 for new data and names dependencies by
+their full-blob digests. Merge retags only device 1, preserves dependency IDs, and
+unifies shared devices. Direct full-blob reads and export expect dependencies in
+the same directory under their digests; standalone bootstraps can resolve them
+through any existing backend. This implementation uses the existing v3 image
+format. V2 bootstrap dictionaries are not accepted; seed the MDBX index from
+published v3 full blobs. The `nydusify` registry conversion CLI does not yet expose
+the dictionary workflow.
+
+The Rust `libmdbx` wrapper vendors libmdbx through `mdbx-sys`; building it needs a
+C compiler and libclang for bindgen. The wrapper is MPL-2.0 licensed. See the
+[wrapper documentation](https://docs.rs/libmdbx/0.6.6/libmdbx/).
+
+(Authored by GPT-6.)
 
 ## Kernel Compatibility and Format Limits
 
@@ -288,7 +374,7 @@ platforms, `fuser` supports only one request thread and rejects a larger
 A nydus image exists in exactly two on-disk layouts, and the `--blob`,
 `--blob-dir` and `--bootstrap` flags map onto them across every subcommand:
 
-- **Single-file image (`--blob`)** — one self-contained full blob:
+- **Single-file image (`--blob`)** — one full blob (dictionary builds also need their referenced blobs):
 	`[data | bootstrap | blob meta | footer]`. Path-addressed: the consumer
 	opens the file you name. Used for transport, piping (the path may be a
 	FIFO), inspection (`nydus check --blob`) and export (`nydus export`).
@@ -330,7 +416,7 @@ Options:
 	--source-type <SOURCE_TYPE>
 		Specify the source type. tar stream-converts one OCI layer tarball: file data is written to the blob as the tar is read, no rootfs is staged on disk, and whiteout entries are kept for the merge subcommand [env: NYDUS_BUILD_SOURCE_TYPE=] [default: dir] [possible values: dir, tar]
 	--blob <BLOB>
-		Specify the file path to save the image as a single self-contained full blob; if the path is an existing FIFO the blob is streamed into it [env: NYDUS_BUILD_BLOB=]
+		Specify the full blob output path; dictionary builds also require their referenced blobs. An existing FIFO streams the output [env: NYDUS_BUILD_BLOB=]
 	--blob-dir <BLOB_DIR>
 		Specify the content-addressed store directory to save the full blob into, named by its SHA256, so mounts resolve it through the bootstrap and images share the store [env: NYDUS_BUILD_BLOB_DIR=]
 	--erofs-data-alignment <EROFS_DATA_ALIGNMENT>
@@ -3054,7 +3140,7 @@ the ondemand blob's sidecar rather than converting old experimental formats.
 Rebuilds a plain OCI image from a nydus image. Exactly one image source is
 expected; directory sources and stacking do not apply.
 
-Every nydus data layer is a self-contained full blob covering exactly one OCI
+Without a chunk dictionary, each nydus data layer is a self-contained full blob covering exactly one OCI
 layer, so each one is unpacked on its own and the merged bootstrap is simply
 dropped (`internal/pipeline/tooci.go`):
 

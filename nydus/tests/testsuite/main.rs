@@ -6,6 +6,7 @@
 //! layout): new test areas join as sibling modules. Shared fixtures come
 //! from `nydus-test-utils`.
 
+mod dictionary;
 mod erofs_reader;
 mod image_prefetch;
 mod incremental_writer;
